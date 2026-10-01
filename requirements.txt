@@ -3,5 +3,6 @@ sounddevice>=0.4.6
 soundfile>=0.12
 pandas>=2.0
 pyarrow>=14
+certifi           # HTTPS certificates for the dataset download (macOS python.org installs)
 onnx>=1.15        # optional: FLOP/parameter count of your model
 pytest>=7         # optional: tests

@@ -6,6 +6,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import pytest
+
+# pi_agent.py runs on the Raspberry Pi (Linux); its process handling is POSIX-only.
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Pi-side agent, POSIX only")
+
 AGENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pi_agent.py")
 
 

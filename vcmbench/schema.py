@@ -34,7 +34,7 @@ class Variation:
 
 
 def load_variations(path: Path = VARIATIONS_CSV) -> list[Variation]:
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         return [Variation(r["label"], int(r["variation"]), r["value"] or "", r["phrase"])
                 for r in csv.DictReader(f)]
 

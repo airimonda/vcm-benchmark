@@ -43,13 +43,24 @@ def _to_float_mono(data: np.ndarray, sr: int) -> np.ndarray:
     return data
 
 
+def _ssl_context():
+    """Use certifi's CA bundle when present: python.org installs on macOS ship without
+    system certificates (CERTIFICATE_VERIFY_FAILED)."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def download_holdout(cache_dir: Path, url: str = HF_URL) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / "holdout.parquet"
     if not path.exists():
         tmp = path.with_suffix(".part")
         print(f"  Downloading holdout set from Hugging Face ({HF_REPO}) ...")
-        with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+        with urllib.request.urlopen(url, timeout=60, context=_ssl_context()) as r, open(tmp, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)
         tmp.rename(path)
