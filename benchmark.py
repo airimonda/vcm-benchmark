@@ -21,10 +21,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import platform
 import random
 import shutil
+import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -438,11 +442,9 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
     todo = [t for t in trials if t["order"] not in done]
     avg = sum(t["total"] for t in todo) / max(len(todo), 1)
     est = len(todo) * (avg + (args.gap_min + args.gap_max) / 2) / 60
-    info(f"{len(todo)} trials to play (~{est:.0f} min). {len(done)} already done.\n"
-         "Keep the room quiet and do not move the laptop or the Pi.\n"
-         "Press Ctrl+C at any time to pause (you can then resume, or stop and score what is done).")
-    if not YES:
-        wait_enter("Press Enter to start")
+    finish = dt.datetime.now() + dt.timedelta(minutes=est)
+    info(f"{len(todo)} trials to play (~{est:.0f} min, done around {finish:%H:%M}). {len(done)} already done.\n"
+         "Running unattended now. Ctrl+C pauses (resume / skip / stop and score).")
     rng = random.Random(args.seed + 1)
     t_start = cfg.get("t_start") or time.time()
     cfg["t_start"] = t_start
@@ -452,11 +454,19 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
         while i < len(todo):
             t = todo[i]
             try:
-                if hasattr(link, "alive") and not link.alive():
-                    info("!! Lost the connection to the Pi. Ctrl+C to pause, fix it, then resume.")
-                play_trial(t, player, link, run_dir)
+                if not ensure_link(link):
+                    info("!! The Pi did not come back. Stopping; results so far are scored.\n"
+                         f"   Fix the connection, then continue with: python benchmark.py --resume {run_dir}")
+                    break
+                if not play_with_retry(t, player, link, run_dir):
+                    info("!! The speaker failed repeatedly. Stopping; results so far are scored.\n"
+                         f"   Fix the audio output, then continue with: python benchmark.py --resume {run_dir}")
+                    break
                 gap = rng.uniform(args.gap_min, args.gap_max)
                 collect(t, link, aliases, t["cmd_end_abs"] + gap, pool)
+                if not link.manual and not link.alive():
+                    info(f"!! Connection dropped during '{t['transcript']}'; this command will be replayed.")
+                    continue
             except KeyboardInterrupt:
                 a = choose("\n  Paused", [("r", "resume (replay this command)"), ("s", "skip this command"),
                                           ("q", "stop now and score what is done")], "r")
@@ -480,11 +490,131 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
     return t_start, time.time()
 
 
+def ensure_link(link, max_wait_s: float = 600) -> bool:
+    """Unattended recovery: if the Pi link is down, reconnect / wait up to max_wait_s."""
+    if link.manual or link.alive():
+        return True
+    info("!! Lost the connection to the Pi. Reconnecting ...")
+    end = time.time() + max_wait_s
+    delay = 5.0
+    while time.time() < end:
+        if isinstance(link, SshLink):
+            try:
+                link.restart()
+            except Exception as e:                       # keep trying until the deadline
+                info(f"   reconnect failed: {e}")
+        time.sleep(delay)
+        if link.alive():
+            info("   Reconnected.")
+            return True
+        delay = min(delay * 2, 60)
+    return False
+
+
+def play_with_retry(t: dict, player, link, run_dir: Path, tries: int = 3) -> bool:
+    for _ in range(tries):
+        try:
+            play_trial(t, player, link, run_dir)
+            return True
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:                           # PortAudio errors, device unplugged, ...
+            info(f"!! Audio error ({e}); retrying in 5 s ...")
+            time.sleep(5)
+            if player:
+                try:
+                    player.__init__(player.device, player.volume)
+                except Exception:
+                    player.__init__(None, player.volume)   # fall back to the default speaker
+    return False
+
+
+@contextmanager
+def keep_awake():
+    """Stop the laptop from sleeping during the unattended run (best effort)."""
+    proc, prev = None, None
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            proc = subprocess.Popen(["caffeinate", "-dimsu", "-w", str(os.getpid())])
+        elif system == "Linux" and shutil.which("systemd-inhibit"):
+            proc = subprocess.Popen(["systemd-inhibit", "--what=idle:sleep", "--who=vcm-benchmark",
+                                     "--why=benchmark running", "sleep", "infinity"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif system == "Windows":
+            import ctypes
+            # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            prev = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002)
+    except Exception as e:
+        info(f"(could not keep the laptop awake: {e}; turn off sleep yourself)")
+    try:
+        yield
+    finally:
+        if proc:
+            proc.terminate()
+        if system == "Windows" and prev is not None:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+
+
+def notify(title: str, msg: str) -> None:
+    """Bell + desktop notification when the unattended run ends (best effort)."""
+    print("\a", end="", flush=True)
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
+                           timeout=5, capture_output=True)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, msg], timeout=5, capture_output=True)
+    except Exception:
+        pass
+
+
+def approve(args, cfg: dict, link, trials: list[dict], run_dir: Path) -> dict | None:
+    """Ask everything that is left, show the plan, and get one go-ahead.
+    After this nothing is asked until the report is printed."""
+    banner("5a", "Approve the unattended run")
+    prof = model_profile(args, cfg, link)
+    if prof:
+        info(f"Model: {prof['params']:,} parameters, {prof['flops_si']} per inference.")
+    if args.delete_audio:
+        cfg["delete_audio"] = True
+    else:
+        cfg["delete_audio"] = yesno("When the test ends, delete the generated audio "
+                                    "(your wake word recordings and the trial files)?", False)
+    path = run_dir / "trials.jsonl"
+    n = len(trials) - (len(path.read_text().splitlines()) if path.exists() else 0)
+    avg = sum(t["total"] for t in trials) / max(len(trials), 1)
+    est = n * (avg + (args.gap_min + args.gap_max) / 2) / 60
+    finish = dt.datetime.now() + dt.timedelta(minutes=est)
+    info(f"\nPlan:\n"
+         f"  Pi            {link.specs.get('model') or '?'} ({cfg['mode']}"
+         f"{', ' + cfg['host'] if cfg.get('host') else ''})\n"
+         f"  wake word     '{cfg['wake_word']}', pause {cfg['wake_gap']} s before the command\n"
+         f"  commands      {n} ({cfg.get('size')}), {args.gap_min:g}-{args.gap_max:g} s apart\n"
+         f"  duration      ~{est:.0f} min, done around {finish:%H:%M}\n"
+         f"  at the end    report saved in {run_dir}; generated audio "
+         f"{'DELETED' if cfg['delete_audio'] else 'kept'}\n")
+    if link.manual:
+        info("Manual mode: you type what the Pi did after every command, so this run is NOT unattended.")
+    else:
+        info("After you approve, the run needs no input. The laptop is kept awake; keep it\n"
+             "plugged in, lid open, volume unchanged, and the room quiet. If the Pi connection\n"
+             "drops, it reconnects and replays that command; if the speaker fails, it retries.")
+        if isinstance(link, SshLink) and not link.batch_ok():
+            info("NOTE: your SSH login asks for a password, so an automatic reconnect cannot log in.\n"
+                 f"      Run `ssh-copy-id {cfg.get('host')}` once to make reconnects work.")
+    if not yesno("Start now?", True):
+        info(f"Not started. Continue later with: python benchmark.py --resume {run_dir}")
+        raise SystemExit(0)
+    return prof
+
+
 # ------------------------------------------------------------------ step 6/7
 
 def model_profile(args, cfg: dict, link) -> dict | None:
     path = args.model or cfg.get("model_path")
-    if path is None and not YES:
+    if path is None and not YES and not link.manual:
         path = ask("Optional: path to your ONNX model for parameter/FLOP counts "
                    "(on this laptop, or 'pi:~/path/model.onnx'; blank = skip)", "")
     if not path:
@@ -516,23 +646,19 @@ def model_profile(args, cfg: dict, link) -> dict | None:
     return p
 
 
-def cleanup(args, run_dir: Path) -> None:
+def cleanup(run_dir: Path, delete: bool) -> None:
     banner(7, "Clean up")
     targets = [p for p in (run_dir / "audio", run_dir / "wake") if p.exists()]
     if not targets:
         return
     size = sum(f.stat().st_size for p in targets for f in p.rglob("*") if f.is_file()) / 1e6
-    info(f"Generated audio: {', '.join(str(p) for p in targets)} ({size:.0f} MB).\n"
-         "Your results (report.md, metrics.json, trials.csv) are kept either way.\n"
-         "Keep the audio if you want to re-run or resume this test.")
-    if args.delete_audio or (not YES and yesno("Delete the generated audio (wake word recordings and trial files)?",
-                                               False)):
+    if delete:
         for p in targets:
             shutil.rmtree(p)
-        info("Deleted.")
-    if (CACHE / "holdout.parquet").exists() and not YES and yesno(
-            "Also delete the downloaded holdout set (re-downloaded next time)?", False):
-        (CACHE / "holdout.parquet").unlink()
+        info(f"Deleted the generated audio ({size:.0f} MB), as chosen before the run.")
+    else:
+        info(f"Kept the generated audio ({size:.0f} MB). Delete it any time with:\n"
+             f"  rm -r {' '.join(str(p) for p in targets)}")
 
 
 def main() -> None:
@@ -608,8 +734,10 @@ def main() -> None:
         if not (args.yes and cfg["mode"] == "sim"):
             sound_check(args, cfg, link, player, run_dir, trials, aliases)
             aliases = S.build_alias_table(cfg.get("aliases"))
+        prof = approve(args, cfg, link, trials, run_dir)
         save_cfg(cfg, run_dir)
-        t_start, t_end = run_trials(args, cfg, link, player, run_dir, trials, aliases)
+        with keep_awake():
+            t_start, t_end = run_trials(args, cfg, link, player, run_dir, trials, aliases)
     finally:
         link.stop()
     save_cfg(cfg, run_dir)
@@ -619,7 +747,6 @@ def main() -> None:
     samples = link.samples
     if not samples and (run_dir / "pi_samples.jsonl").exists():
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text().splitlines() if l]
-    prof = model_profile(args, cfg, link) if not args.yes else None
     meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size")}
     meta["holdout"] = cfg.get("holdout") or "huggingface"
     meta["gap_s"] = [args.gap_min, args.gap_max]
@@ -628,7 +755,9 @@ def main() -> None:
     print()
     print(report.read_text())
     info(f"Saved: {report}, metrics.json, trials.csv, pi_metrics.csv in {run_dir}")
-    cleanup(args, run_dir)
+    cleanup(run_dir, bool(cfg.get("delete_audio")))
+    acc = m["intent_level"]["accuracy"]
+    notify("VCM benchmark finished", f"{len(done)} commands, intent accuracy {100 * acc:.1f}%")
 
 
 def save_cfg(cfg: dict, run_dir: Path) -> None:

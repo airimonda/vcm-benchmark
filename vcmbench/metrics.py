@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 
-from .schema import NONE, OOS, REJECT, SLOTTED, VARIATIONS, variations_for
+from .schema import NONE, OOS, REJECT, SLOTTED, variations_for
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:

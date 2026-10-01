@@ -136,14 +136,22 @@ def _wait(pred, timeout=8.0):
     return False
 
 
+def _fake_ssh_link(tmp_path, monkeypatch, log):
+    """SshLink driving the real pi_agent.py through a fake `ssh` that runs the last argument locally."""
+    fake = tmp_path / "fakessh"
+    fake.write_text('#!/bin/sh\nfor a; do last="$a"; done\nexec sh -c "$last"\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(P, "REMOTE_AGENT", str(ROOT / "pi_agent.py"))
+    link = P.SshLink(P.LineParser(), "pi@x", [], tmp_path / "cm", [str(log)], [], "pytest", interval=0.2,
+                     python=sys.executable)
+    link.ssh = [str(fake), "pi@x"]
+    return link
+
+
 def test_ssh_link_with_local_agent(tmp_path, monkeypatch):
-    """SshLink driving pi_agent.py through `sh -c` instead of ssh."""
     log = tmp_path / "live.log"
     log.write_text("")
-    monkeypatch.setattr(P, "REMOTE_AGENT", str(ROOT / "pi_agent.py"))
-    link = P.SshLink(P.LineParser(), "x", [], tmp_path / "cm", [str(log)], [], "pytest", interval=0.2,
-                     python=sys.executable)
-    link.ssh = ["sh", "-c"]
+    link = _fake_ssh_link(tmp_path, monkeypatch, log)
     link.start()
     try:
         assert link.rtt is not None and abs(link.offset) < 0.5
@@ -156,6 +164,29 @@ def test_ssh_link_with_local_agent(tmp_path, monkeypatch):
         assert abs(ev.t - time.time()) < 2
         assert _wait(lambda: len(link.samples) >= 2)
         assert link.specs.get("type") == "specs"
+    finally:
+        link.stop()
+
+
+def test_ssh_link_reconnects(tmp_path, monkeypatch):
+    """Unattended run: a dropped agent is restarted and events flow again."""
+    import benchmark as B
+    log = tmp_path / "live.log"
+    log.write_text("")
+    link = _fake_ssh_link(tmp_path, monkeypatch, log)
+    link.start()
+    try:
+        link.proc.kill()
+        link.proc.wait()
+        assert not link.alive()
+        real_sleep = time.sleep
+        monkeypatch.setattr(B.time, "sleep", lambda s: real_sleep(min(s, 0.5)))
+        assert B.ensure_link(link, max_wait_s=30)
+        assert link.alive()
+        time.sleep(0.5)
+        with open(log, "a") as f:
+            f.write("intent=PAUSE\n")
+        assert _wait(lambda: not link.events.empty())
     finally:
         link.stop()
 

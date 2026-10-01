@@ -228,9 +228,10 @@ class SshLink(PiLink):
             raise RuntimeError("pi_agent.py gave no specs: " + r.stderr.decode(errors="replace")[-500:])
         return self.specs
 
-    def start(self) -> None:
+    def start(self, extra_opts: tuple = ()) -> None:
         cmd = " ".join([self.python, "-u", REMOTE_AGENT] + [shlex.quote(a) for a in self.args])
-        self.proc = subprocess.Popen(self.ssh + [cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        ssh = self.ssh[:-1] + list(extra_opts) + [self.target]
+        self.proc = subprocess.Popen(ssh + [cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, bufsize=0)
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._err_reader, daemon=True).start()
@@ -258,6 +259,21 @@ class SshLink(PiLink):
         assert self.proc and self.proc.stderr
         for raw in self.proc.stderr:
             self.errors.append({"where": "ssh", "msg": raw.decode(errors="replace").strip()})
+
+    def batch_ok(self) -> bool:
+        """True if SSH logs in without a password prompt (needed for unattended reconnects)."""
+        try:
+            r = subprocess.run(self.ssh[:-1] + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                                self.target, "true"], capture_output=True, timeout=30)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def restart(self) -> None:
+        """Start a fresh agent after the connection dropped. BatchMode: never hang on a password prompt."""
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+        self.start(("-o", "BatchMode=yes", "-o", "ConnectTimeout=15"))
 
     def ping(self) -> None:
         if not self.proc or not self.proc.stdin:

@@ -44,11 +44,23 @@ The script walks you through these steps:
    Wake word and command are levelled to the same loudness.
 4. **Sound check**: two warm-up commands, not scored. You see the log lines your Pi printed and
    how they were understood. Fix the volume or the output format here.
-5. **Test**: commands play 10-15 s apart (random), so your assistant goes back to sleep between
-   turns. Ctrl+C pauses (resume / skip / stop and score).
-6. **Results** are printed and saved in `runs/<date-time>/`.
-7. **Clean up**: you choose whether to delete the generated audio (your wake word recordings and
-   the trial files). Results are always kept.
+5. **Approve**: every remaining question comes now: ONNX model path (optional), and whether to
+   delete the generated audio at the end. You see the plan (number of commands, duration,
+   finish time) and answer **Start now?** once.
+6. **Test, unattended**: from here on nothing is asked. Commands play 10-15 s apart (random), so
+   your assistant goes back to sleep between turns. You can walk away:
+   * the laptop is kept awake (macOS `caffeinate`, Linux `systemd-inhibit`, Windows API);
+     keep it plugged in with the lid open;
+   * if the Pi connection drops, the script reconnects (up to 10 min) and replays that command;
+     for this, SSH must log in without a password (`ssh-copy-id user@host`; the approval screen
+     warns you if it can't);
+   * if the speaker fails, it retries, then falls back to the default speaker;
+   * if recovery fails, it stops, scores what is done, and tells you the `--resume` command.
+
+   Ctrl+C still pauses (resume / skip / stop and score). Manual mode cannot run unattended.
+7. **Results** are printed and saved in `runs/<date-time>/`. A desktop notification says it is done.
+8. **Clean up**: the generated audio (your wake word recordings and the trial files) is deleted or
+   kept as you chose in step 5. Results are always kept.
 
 Test size: **full** = all 196 holdout clips (186 commands = 2 per variation, plus 10 out-of-scope),
 about 55 min. **quick** = 1 clip per variation + the 10 out-of-scope clips (103), about 30 min.
