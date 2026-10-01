@@ -201,7 +201,7 @@ def record_wake(args, cfg: dict, run_dir: Path) -> tuple[str, list]:
     cfg["wake_word"] = word
     wake_dir = run_dir / "wake"
     if args.wake_files:
-        takes = [A.normalize(A.trim(A.load(Path(p)))) for p in args.wake_files]
+        takes = [A.normalize(A.main_burst(A.load(Path(p)))) for p in args.wake_files]
         info(f"Using {len(takes)} wake word file(s) from --wake-files.")
         for i, t in enumerate(takes):
             A.save(wake_dir / f"wake_{i + 1}.wav", t)
@@ -223,8 +223,8 @@ def record_wake(args, cfg: dict, run_dir: Path) -> tuple[str, list]:
     takes = []
     while len(takes) < n:
         wait_enter(f"Take {len(takes) + 1}/{n}: press Enter, then say '{word}' once")
-        raw = A.record(2.5, dev)
-        x = A.trim(raw)
+        raw = A.record(3.0, dev)
+        x = A.main_burst(raw)
         peak = float(abs(raw).max())
         dur = len(x) / A.SR
         if peak < 0.02 or dur < 0.15:
@@ -233,8 +233,9 @@ def record_wake(args, cfg: dict, run_dir: Path) -> tuple[str, list]:
         if peak > 0.99:
             info("Clipped (too loud). Move back a little. Again.")
             continue
-        if dur > 2.2:
-            info(f"That was {dur:.1f} s long: say only the wake word. Again.")
+        if dur > 1.8:
+            info(f"Heard {dur:.1f} s of sound: say only the wake word, and keep the room quiet "
+                 f"(noise level {A.dbfs(raw):.0f} dBFS). Again.")
             continue
         x = A.normalize(x)
         info(f"Got {dur:.2f} s. Playing it back ...")

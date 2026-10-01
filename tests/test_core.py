@@ -194,3 +194,16 @@ def test_sim_run(tmp_path):
     m = json.loads((run / "metrics.json").read_text())
     assert m["pipeline"]["trials"] == 6
     assert (run / "trials.csv").exists() and (run / "report.md").exists()
+
+
+@pytest.mark.parametrize("noise_db", [-60, -40, -30])
+def test_main_burst_noisy_wake_take(noise_db):
+    """Laptop mic noise above -50 dBFS used to make the whole 2.5 s take count as speech."""
+    sr = A.SR
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(3 * sr).astype(np.float32) * 10 ** (noise_db / 20)
+    t = np.arange(sr // 2) / sr
+    x[int(1.2 * sr): int(1.2 * sr) + len(t)] += 0.3 * np.sin(2 * np.pi * 220 * t) * np.hanning(len(t))
+    x[800:1100] += 0.5                                   # key click right after Enter
+    y = A.main_burst(x)
+    assert 0.35 <= len(y) / sr <= 0.9

@@ -24,23 +24,68 @@ def dbfs(x: np.ndarray) -> float:
     return 20 * np.log10(max(rms, 1e-9))
 
 
+def _frame_db(x: np.ndarray, hop: int) -> np.ndarray:
+    n = len(x) // hop
+    frames = x[: n * hop].reshape(n, hop).astype(np.float64)
+    frames = frames - frames.mean(axis=1, keepdims=True)        # ignore DC offset
+    return 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-12)
+
+
+def _threshold(e: np.ndarray, rel_db: float, floor_db: float, snr_db: float) -> float:
+    """Speech threshold: above the noise floor (10th-percentile frame) by snr_db,
+    and no more than rel_db below the loudest frame."""
+    noise = np.percentile(e, 10)
+    thr = max(noise + snr_db, floor_db)
+    return min(thr, e.max() - 6) if e.max() - 6 > noise else max(thr, e.max() - rel_db)
+
+
 def trim(x: np.ndarray, sr: int = SR, pad_s: float = 0.08, rel_db: float = 35.0,
-         floor_db: float = -50.0) -> np.ndarray:
-    """Cut leading/trailing silence (20 ms frames, threshold relative to the loudest frame)."""
+         floor_db: float = -50.0, snr_db: float = 12.0) -> np.ndarray:
+    """Cut leading/trailing silence (20 ms frames).
+
+    The threshold adapts to the recording's noise floor, so a laptop mic with
+    fan/room noise above -50 dBFS still gets trimmed.
+    """
     hop = int(0.02 * sr)
     if len(x) < hop * 2:
         return x
-    n = len(x) // hop
-    frames = x[: n * hop].reshape(n, hop)
-    e = 10 * np.log10(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-12)
-    thr = max(e.max() - rel_db, floor_db)
-    voiced = np.flatnonzero(e > thr)
+    e = _frame_db(x, hop)
+    voiced = np.flatnonzero(e > _threshold(e, rel_db, floor_db, snr_db))
     if len(voiced) == 0:
         return x
     pad = int(pad_s * sr)
     a = max(voiced[0] * hop - pad, 0)
     b = min((voiced[-1] + 1) * hop + pad, len(x))
     return x[a:b]
+
+
+def main_burst(x: np.ndarray, sr: int = SR, max_gap_s: float = 0.25, pad_s: float = 0.15,
+               snr_db: float = 12.0) -> np.ndarray:
+    """Keep only the loudest stretch of speech (for a one-word wake word take).
+
+    Voiced frames closer than max_gap_s are merged into one segment; the
+    segment with the most energy wins. Drops key clicks, breaths and noise
+    bursts before/after the word.
+    """
+    hop = int(0.02 * sr)
+    if len(x) < hop * 2:
+        return x
+    e = _frame_db(x, hop)
+    voiced = np.flatnonzero(e > _threshold(e, 35.0, -50.0, snr_db))
+    if len(voiced) == 0:
+        return x
+    gap = int(max_gap_s / 0.02)
+    segs, start, prev = [], voiced[0], voiced[0]
+    for v in voiced[1:]:
+        if v - prev > gap:
+            segs.append((start, prev))
+            start = v
+        prev = v
+    segs.append((start, prev))
+    power = 10 ** (e / 10)
+    a, b = max(segs, key=lambda s: power[s[0]: s[1] + 1].sum())
+    pad = int(pad_s * sr)
+    return x[max(a * hop - pad, 0): min((b + 1) * hop + pad, len(x))]
 
 
 def normalize(x: np.ndarray, target_dbfs: float = -20.0, peak_limit: float = 0.95) -> np.ndarray:
