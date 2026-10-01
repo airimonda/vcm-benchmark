@@ -19,7 +19,7 @@ laptop speaker  ──(sound)──▶  Pi mic ─▶ your assistant ─▶ log 
 Python 3.10 or newer.
 
 ```bash
-git clone <this repo> && cd vcm-benchmark
+git clone https://github.com/airimonda/vcm-benchmark.git && cd vcm-benchmark
 python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
