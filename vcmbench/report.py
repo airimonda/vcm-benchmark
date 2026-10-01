@@ -197,16 +197,16 @@ TRIAL_COLUMNS = ["order", "clip_idx", "transcript", "true_intent", "true_variati
 
 
 def write_outputs(run_dir: Path, m: dict, trials: list[dict], samples: list[dict]) -> Path:
-    (run_dir / "metrics.json").write_text(json.dumps(m, indent=2, default=str))
+    (run_dir / "metrics.json").write_text(json.dumps(m, indent=2, default=str), encoding="utf-8")
     md = render_markdown(m)
-    (run_dir / "report.md").write_text(md)
-    with open(run_dir / "trials.csv", "w", newline="") as f:
+    (run_dir / "report.md").write_text(md, encoding="utf-8")
+    with open(run_dir / "trials.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(trials)
     if samples:
         keys = ["t", "temp_c", "cpu_pct", "freq_mhz", "load1", "mem_used_mb", "mem_avail_mb", "throttled"]
-        with open(run_dir / "pi_metrics.csv", "w", newline="") as f:
+        with open(run_dir / "pi_metrics.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(keys + ["proc_cpu_pct", "proc_rss_mb", "proc_cpu_time_s"])
             for s in samples:

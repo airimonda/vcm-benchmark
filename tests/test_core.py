@@ -148,6 +148,10 @@ def _fake_ssh_link(tmp_path, monkeypatch, log):
     return link
 
 
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a POSIX shell script")
+
+
+@posix_only
 def test_ssh_link_with_local_agent(tmp_path, monkeypatch):
     log = tmp_path / "live.log"
     log.write_text("")
@@ -168,6 +172,7 @@ def test_ssh_link_with_local_agent(tmp_path, monkeypatch):
         link.stop()
 
 
+@posix_only
 def test_ssh_link_reconnects(tmp_path, monkeypatch):
     """Unattended run: a dropped agent is restarted and events flow again."""
     import benchmark as B
@@ -212,14 +217,12 @@ def test_http_link_with_local_agent(tmp_path):
         link.stop()
 
 
-@pytest.mark.skipif(not (ROOT / ".cache" / "holdout.parquet").exists(), reason="holdout not downloaded")
 def test_sim_run(tmp_path):
     """Whole wizard in simulation mode, no sound, non-interactive."""
     r = subprocess.run([sys.executable, str(ROOT / "benchmark.py"), "--mode", "sim", "--no-audio", "--yes",
                         "--fresh", "--size", "quick", "--limit", "6", "--gap-min", "1", "--gap-max", "1.1",
-                        "--wake-word", "Watson", "--runs-dir", str(tmp_path), "--holdout",
-                        str(ROOT / ".cache" / "holdout.parquet")],
-                       capture_output=True, text=True, timeout=180)
+                        "--wake-word", "Watson", "--runs-dir", str(tmp_path)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
     run = next(tmp_path.iterdir())
     m = json.loads((run / "metrics.json").read_text())

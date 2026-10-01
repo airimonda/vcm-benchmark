@@ -14,18 +14,45 @@ laptop speaker  ──(sound)──▶  Pi mic ─▶ your assistant ─▶ log 
       └──────────── benchmark.py ◀── pi_agent.py (SSH or HTTP) ◀─┘  + CPU / temp / RAM every second
 ```
 
-## Install (laptop)
+## Install (laptop: macOS or Windows)
 
-Python 3.10 or newer.
+Python 3.10 or newer. On Windows install it from python.org and tick **"Add python.exe to PATH"**.
+
+macOS (Terminal):
 
 ```bash
 git clone https://github.com/airimonda/vcm-benchmark.git && cd vcm-benchmark
-python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Linux laptops also need PortAudio: `sudo apt install libportaudio2`.
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/airimonda/vcm-benchmark.git; cd vcm-benchmark
+py -m venv .venv; .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+If PowerShell refuses to run `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once. No git? Download the ZIP from GitHub
+(Code > Download ZIP) and unzip it.
+
 On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard library.
+(Linux laptops: also `sudo apt install libportaudio2`.)
+
+### Per-OS notes
+
+| | macOS | Windows |
+|---|---|---|
+| Run the script | `python benchmark.py` | `python benchmark.py` (or `py benchmark.py`) |
+| Microphone permission | allow Terminal when asked (System Settings > Privacy > Microphone) | Settings > Privacy > Microphone > let desktop apps use it |
+| SSH client | built in | built in on Windows 10/11; if `ssh` is missing: Settings > System > Optional features > OpenSSH Client |
+| Password-less SSH (needed for unattended reconnects) | `ssh-keygen -t ed25519`, then `ssh-copy-id user@pi` | `ssh-keygen -t ed25519`, then `type $env:USERPROFILE\.ssh\id_ed25519.pub \| ssh user@pi "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"` |
+| SSH password prompts | asked once per run (shared connection) | asked at each step (Windows ssh has no shared connection), so set up the key |
+| Connection 2 (Pi to laptop) | allow incoming connections for Python when asked | allow Python in the Windows Defender Firewall prompt (Private networks) |
+| Kept awake during the run | `caffeinate` | Windows power request (no setting needed); still keep it plugged in |
+| Done notification | Notification Center | tray balloon |
 
 ## Run
 

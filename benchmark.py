@@ -41,6 +41,13 @@ from vcmbench.pi import (HttpLink, LineParser, ManualLink, SimLink, SshLink,  # 
                          laptop_ips)
 from vcmbench.report import score, write_outputs                 # noqa: E402
 
+IS_WINDOWS = platform.system() == "Windows"
+for _stream in (sys.stdout, sys.stderr):        # Pi log lines may hold characters cp1252 can't print
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 SAVED_SETTINGS = ROOT / "bench_settings.json"     # remembered answers (git-ignored)
 CACHE = ROOT / ".cache"
 
@@ -138,6 +145,10 @@ def setup_pi(args, cfg: dict, run_dir: Path):
         target = args.host or cfg.get("host") or ask("SSH target (user@host or ~/.ssh/config alias)",
                                                      "pi@raspberrypi.local")
         cfg["host"] = target
+        if not shutil.which("ssh"):
+            info("No `ssh` command found. Windows 10/11: Settings > System > Optional features >\n"
+                 "Add a feature > 'OpenSSH Client', then open a new terminal. Or use connection 2 or 3.")
+            raise SystemExit(1)
         link = SshLink(parser, target, args.ssh_opt or cfg.get("ssh_opts") or [], CACHE / "ssh",
                        cfg["logs"], cfg["log_cmds"], cfg["proc"] or None,
                        python=cfg.get("pi_python", "python3"))
@@ -146,7 +157,7 @@ def setup_pi(args, cfg: dict, run_dir: Path):
         if not ok:
             info(f"SSH failed: {out}\n"
                  "Check: Pi on, same network (or Tailscale up), `ssh {target}` works in a terminal.\n"
-                 "Tip: `ssh-copy-id {target}` once, so no password is needed.")
+                 + key_tip(target))
             raise SystemExit(1)
         link.upload_agent()
         specs = link.fetch_specs()
@@ -193,7 +204,7 @@ def setup_pi(args, cfg: dict, run_dir: Path):
     if specs.get("audio_inputs"):
         info("  microphones    " + " / ".join(l.strip() for l in str(specs["audio_inputs"]).splitlines()
                                              if l.startswith("card"))[:200])
-    (run_dir / "pi_specs.json").write_text(json.dumps(specs, indent=2))
+    (run_dir / "pi_specs.json").write_text(json.dumps(specs, indent=2), encoding="utf-8")
     return link
 
 
@@ -295,8 +306,8 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
         trials.append({"order": k, "clip_idx": c.idx, "transcript": c.transcript,
                        "true_intent": c.intent, "true_variation": c.variation, "true_slot": c.slot_value,
                        "speaker_id": c.speaker_id, "is_synthetic": c.is_synthetic,
-                       "wake_take": wi + 1, "audio_file": str(path.relative_to(run_dir)), **off})
-    (run_dir / "plan.json").write_text(json.dumps(trials, indent=2))
+                       "wake_take": wi + 1, "audio_file": path.relative_to(run_dir).as_posix(), **off})
+    (run_dir / "plan.json").write_text(json.dumps(trials, indent=2), encoding="utf-8")
     info(f"Wrote {len(trials)} trial files to {out_dir}")
     return trials
 
@@ -436,7 +447,7 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
     done_path = run_dir / "trials.jsonl"
     done = {}
     if done_path.exists():
-        for line in done_path.read_text().splitlines():
+        for line in done_path.read_text(encoding="utf-8").splitlines():
             r = json.loads(line)
             done[r["order"]] = r
     todo = [t for t in trials if t["order"] not in done]
@@ -449,7 +460,7 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
     t_start = cfg.get("t_start") or time.time()
     cfg["t_start"] = t_start
     pool: list = []
-    with open(done_path, "a") as f:
+    with open(done_path, "a", encoding="utf-8") as f:
         i = 0
         while i < len(todo):
             t = todo[i]
@@ -486,7 +497,7 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
             f.flush()
             i += 1
     if isinstance(link, (SshLink, HttpLink, SimLink)):
-        (run_dir / "pi_samples.jsonl").write_text("\n".join(json.dumps(s) for s in link.samples))
+        (run_dir / "pi_samples.jsonl").write_text("\n".join(json.dumps(s) for s in link.samples), encoding="utf-8")
     return t_start, time.time()
 
 
@@ -564,10 +575,28 @@ def notify(title: str, msg: str) -> None:
         if platform.system() == "Darwin":
             subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
                            timeout=5, capture_output=True)
+        elif IS_WINDOWS:
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; "
+                  "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+                  f"$n.ShowBalloonTip(10000, '{title}', '{msg}', 'Info'); Start-Sleep 8; $n.Dispose()")
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif shutil.which("notify-send"):
             subprocess.run(["notify-send", title, msg], timeout=5, capture_output=True)
     except Exception:
         pass
+
+
+def key_tip(target: str | None) -> str:
+    """How to set up password-less SSH, per laptop OS."""
+    t = target or "user@pi"
+    if IS_WINDOWS:
+        return ("      Set up an SSH key once (PowerShell):\n"
+                "        ssh-keygen -t ed25519      (press Enter at every question)\n"
+                f'        type $env:USERPROFILE\\.ssh\\id_ed25519.pub | ssh {t} '
+                '"mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"')
+    return (f"      Set up an SSH key once: `ssh-keygen -t ed25519` (if you have none), "
+            f"then `ssh-copy-id {t}`.")
 
 
 def approve(args, cfg: dict, link, trials: list[dict], run_dir: Path) -> dict | None:
@@ -583,7 +612,7 @@ def approve(args, cfg: dict, link, trials: list[dict], run_dir: Path) -> dict | 
         cfg["delete_audio"] = yesno("When the test ends, delete the generated audio "
                                     "(your wake word recordings and the trial files)?", False)
     path = run_dir / "trials.jsonl"
-    n = len(trials) - (len(path.read_text().splitlines()) if path.exists() else 0)
+    n = len(trials) - (len(path.read_text(encoding="utf-8").splitlines()) if path.exists() else 0)
     avg = sum(t["total"] for t in trials) / max(len(trials), 1)
     est = n * (avg + (args.gap_min + args.gap_max) / 2) / 60
     finish = dt.datetime.now() + dt.timedelta(minutes=est)
@@ -603,7 +632,7 @@ def approve(args, cfg: dict, link, trials: list[dict], run_dir: Path) -> dict | 
              "drops, it reconnects and replays that command; if the speaker fails, it retries.")
         if isinstance(link, SshLink) and not link.batch_ok():
             info("NOTE: your SSH login asks for a password, so an automatic reconnect cannot log in.\n"
-                 f"      Run `ssh-copy-id {cfg.get('host')}` once to make reconnects work.")
+                 + key_tip(cfg.get("host")))
     if not yesno("Start now?", True):
         info(f"Not started. Continue later with: python benchmark.py --resume {run_dir}")
         raise SystemExit(0)
@@ -657,8 +686,10 @@ def cleanup(run_dir: Path, delete: bool) -> None:
             shutil.rmtree(p)
         info(f"Deleted the generated audio ({size:.0f} MB), as chosen before the run.")
     else:
-        info(f"Kept the generated audio ({size:.0f} MB). Delete it any time with:\n"
-             f"  rm -r {' '.join(str(p) for p in targets)}")
+        quoted = ", ".join('"%s"' % p for p in targets)
+        cmd = (f"Remove-Item -Recurse {quoted}" if IS_WINDOWS
+               else "rm -r " + " ".join(str(p) for p in targets))
+        info(f"Kept the generated audio ({size:.0f} MB). Delete it any time with:\n  {cmd}")
 
 
 def main() -> None:
@@ -703,13 +734,13 @@ def main() -> None:
 
     if args.resume:
         run_dir = Path(args.resume)
-        cfg = json.loads((run_dir / "config.json").read_text())
-        trials = json.loads((run_dir / "plan.json").read_text())
+        cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        trials = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
         info(f"Resuming {run_dir}")
     else:
         cfg = {}
         if SAVED_SETTINGS.exists() and not args.fresh:
-            saved = json.loads(SAVED_SETTINGS.read_text())
+            saved = json.loads(SAVED_SETTINGS.read_text(encoding="utf-8"))
             if yesno(f"Reuse your settings from last time (mode {saved.get('mode')}, "
                      f"host {saved.get('host', '-')}, wake word {saved.get('wake_word')})?"):
                 cfg = {k: v for k, v in saved.items() if k not in ("t_start",)}
@@ -743,17 +774,17 @@ def main() -> None:
     save_cfg(cfg, run_dir)
 
     banner(6, "Results")
-    done = [json.loads(l) for l in (run_dir / "trials.jsonl").read_text().splitlines()]
+    done = [json.loads(l) for l in (run_dir / "trials.jsonl").read_text(encoding="utf-8").splitlines()]
     samples = link.samples
     if not samples and (run_dir / "pi_samples.jsonl").exists():
-        samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text().splitlines() if l]
+        samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
     meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size")}
     meta["holdout"] = cfg.get("holdout") or "huggingface"
     meta["gap_s"] = [args.gap_min, args.gap_max]
     m = score(done, samples, link.specs, prof, t_start, t_end, meta)
     report = write_outputs(run_dir, m, done, samples)
     print()
-    print(report.read_text())
+    print(report.read_text(encoding="utf-8"))
     info(f"Saved: {report}, metrics.json, trials.csv, pi_metrics.csv in {run_dir}")
     cleanup(run_dir, bool(cfg.get("delete_audio")))
     acc = m["intent_level"]["accuracy"]
@@ -761,11 +792,11 @@ def main() -> None:
 
 
 def save_cfg(cfg: dict, run_dir: Path) -> None:
-    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     if cfg.get("mode") == "sim":
         return                         # a dry run must not overwrite real settings
     keep = {k: v for k, v in cfg.items() if k not in ("started", "t_start", "size")}
-    SAVED_SETTINGS.write_text(json.dumps(keep, indent=2))
+    SAVED_SETTINGS.write_text(json.dumps(keep, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

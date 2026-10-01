@@ -16,6 +16,7 @@ and an event queue of parsed log lines with laptop-clock timestamps.
 from __future__ import annotations
 
 import json
+import platform
 import queue
 import random
 import re
@@ -189,10 +190,15 @@ class SshLink(PiLink):
         super().__init__(parser)
         self.target = target
         self.python = python
-        # one shared SSH connection, so a password is asked at most once
-        control_dir.mkdir(parents=True, exist_ok=True)
-        self.ssh = ["ssh", "-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/cm-%C",
-                    "-o", "ControlPersist=900", "-o", "ServerAliveInterval=10", *ssh_opts, target]
+        # macOS/Linux: one shared SSH connection, so a password is asked at most once.
+        # Windows OpenSSH has no connection sharing: each step logs in again (use an SSH key).
+        self.shared = platform.system() != "Windows"
+        share = []
+        if self.shared:
+            control_dir.mkdir(parents=True, exist_ok=True)
+            share = ["-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/cm-%C",
+                     "-o", "ControlPersist=900"]
+        self.ssh = ["ssh", *share, "-o", "ServerAliveInterval=10", *ssh_opts, target]
         self.args = self.agent_args(logs, log_cmds, proc, interval)
         self.proc: subprocess.Popen | None = None
         self._ping_sent: dict[str, float] = {}
@@ -304,7 +310,8 @@ class SshLink(PiLink):
                 self.proc.wait(timeout=5)
             except Exception:
                 self.proc.kill()
-        subprocess.run(self.ssh[:-1] + ["-O", "exit", self.target], capture_output=True)
+        if self.shared:
+            subprocess.run(self.ssh[:-1] + ["-O", "exit", self.target], capture_output=True)
 
 
 class HttpLink(PiLink):
