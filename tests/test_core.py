@@ -459,3 +459,15 @@ def test_rescore_cli(tmp_path):
     m = _json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
     assert m["intent_level"]["accuracy"] == 1.0
     assert _json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["id_order"] == "alphabetical"
+
+
+@pytest.mark.parametrize("raw,target,opts", [
+    ("abnunez@100.75.251.43", "abnunez@100.75.251.43", []),
+    ("ssh abnunez@100.75.251.43", "abnunez@100.75.251.43", []),
+    ("ssh pi@host -p 2222", "pi@host", ["-p", "2222"]),
+    ("ssh -i ~/.ssh/k pi@raspberrypi.local", "pi@raspberrypi.local", ["-i", "~/.ssh/k"]),
+    ("mypi", "mypi", []),
+])
+def test_parse_ssh_target(raw, target, opts):
+    import benchmark as B
+    assert B.parse_ssh_target(raw) == (target, opts)

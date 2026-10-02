@@ -18,7 +18,8 @@ Options:
     --log-cmd CMD     run CMD in a shell (repeatable) and report each output line
                       (stdout+stderr) as a log with path "cmd:CMD"; restarted
                       2 s after it exits, e.g. "journalctl --user -u vcm -f -n 0 -o cat"
-    --proc PATTERN    regex matched against process command lines; CPU, memory
+    --proc PATTERN    regex matched against process command lines (default: the
+                      process that has the --log file open); CPU, memory
                       and threads of matching processes are summed
     --interval SECS   metrics period (default 1.0)
     --post URL        push messages to URL/event (no stdin); clock sync via
@@ -295,6 +296,37 @@ def find_pids(regex, own):
     return sorted(pids)
 
 
+def find_log_writers(paths, own):
+    """PIDs that have one of the log files open: the assistant writing its log."""
+    targets = set()
+    for p in paths:
+        try:
+            targets.add(os.path.realpath(os.path.expanduser(p)))
+        except Exception:
+            pass
+    pids = []
+    if not targets:
+        return pids
+    try:
+        names = os.listdir("/proc")
+    except Exception:
+        return pids
+    for n in names:
+        if not n.isdigit() or int(n) in own:
+            continue
+        try:
+            for fd in os.listdir("/proc/%s/fd" % n):
+                try:
+                    if os.readlink("/proc/%s/fd/%s" % (n, fd)) in targets:
+                        pids.append(int(n))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return sorted(pids)
+
+
 def proc_stat(pid):
     """Return (cpu_ticks, rss_mb, threads) or None."""
     try:
@@ -314,7 +346,7 @@ def proc_stat(pid):
         return None
 
 
-def metrics_loop(interval, pattern):
+def metrics_loop(interval, pattern, log_paths=()):
     try:
         regex = re.compile(pattern) if pattern else None
     except re.error as e:
@@ -352,10 +384,11 @@ def metrics_loop(interval, pattern):
             m["mem_avail_mb"] = kb_to_mb(avail)
             m["mem_used_mb"] = kb_to_mb(total - avail) if total and avail is not None else None
             m["throttled"] = get_throttled()
-            if regex is None:
+            if regex is None and not log_paths:
                 m["proc"] = None
             else:
-                pids = find_pids(regex, own)
+                # --proc regex if given, else whoever has the log file open (the assistant)
+                pids = find_pids(regex, own) if regex is not None else find_log_writers(log_paths, own)
                 ticks_now = {}
                 rss = 0.0
                 threads = 0
@@ -618,7 +651,7 @@ def main(argv=None):
         start(tail_loop, p)
     for c in args.log_cmd:
         start(cmd_loop, c)
-    start(metrics_loop, max(0.05, args.interval), args.proc)
+    start(metrics_loop, max(0.05, args.interval), args.proc, tuple(args.log))
 
     while not STOP.wait(0.2):
         pass

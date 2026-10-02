@@ -139,3 +139,23 @@ def test_log_cmd():
     finally:
         if p.poll() is None:
             p.kill()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs Linux /proc (the Pi)")
+def test_find_log_writers(tmp_path):
+    """Without --proc, the agent measures whichever process has the log file open."""
+    sys.path.insert(0, os.path.dirname(AGENT))
+    import pi_agent
+    log = tmp_path / "vcm_benchmark.log"
+    writer = subprocess.Popen([sys.executable, "-c",
+                               "import time,sys; f=open(sys.argv[1],'a'); f.write('x\\n'); f.flush(); time.sleep(30)",
+                               str(log)])
+    try:
+        deadline = time.time() + 5
+        pids = []
+        while time.time() < deadline and writer.pid not in pids:
+            pids = pi_agent.find_log_writers([str(log)], set([os.getpid()]))
+            time.sleep(0.1)
+        assert writer.pid in pids
+    finally:
+        writer.kill()
