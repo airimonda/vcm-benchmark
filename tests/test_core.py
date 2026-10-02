@@ -221,12 +221,12 @@ def test_sim_run(tmp_path):
     """Whole wizard in simulation mode, no sound, non-interactive."""
     r = subprocess.run([sys.executable, str(ROOT / "benchmark.py"), "--mode", "sim", "--no-audio", "--yes",
                         "--fresh", "--size", "quick", "--limit", "6", "--gap-min", "1", "--gap-max", "1.1",
-                        "--wake-word", "Watson", "--runs-dir", str(tmp_path)],
+                        "--wake-word", "Watson", "--seed", "5", "--runs-dir", str(tmp_path)],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
     run = next(tmp_path.iterdir())
     m = json.loads((run / "metrics.json").read_text())
-    assert m["pipeline"]["trials"] == 6
+    assert m["pipeline"]["trials"] + m["false_wake"]["n"] == 6        # wake + no-wake trials
     assert (run / "trials.csv").exists() and (run / "report.md").exists()
 
 
