@@ -82,7 +82,8 @@ def intent_label(intent: str) -> str:
     return REJECT if intent in (OOS, NONE, "") else intent
 
 
-def command_label(intent: str, slot: str, truth_variation: str | None, slot_ok: bool) -> str:
+def command_label(intent: str, slot: str, truth_variation: str | None, slot_ok: bool,
+                  pred_variation: str = "") -> str:
     """93-way label of a prediction.
 
     The Pi predicts (intent, slot), not the wording, so a prediction counts as
@@ -96,6 +97,8 @@ def command_label(intent: str, slot: str, truth_variation: str | None, slot_ok: 
         return truth_variation
     if intent.startswith("OTHER:"):
         return intent
+    if pred_variation:                     # 93-class model: the phrase it actually chose
+        return pred_variation
     if intent in SLOTTED:
         from .slots import SLOT_VALUES, slot_distance
         for value in SLOT_VALUES[intent]:

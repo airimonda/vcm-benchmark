@@ -121,8 +121,8 @@ Extra ssh options: `--ssh-opt=-p2222 --ssh-opt=-i~/.ssh/mykey`.
 ## What your Pi must print
 
 Your assistant must write **one line per recognised command** to a log file (or to a systemd
-journal / any command output you can follow). Every line must carry the intent, the slot (for
-slotted intents), and two timing fields:
+journal / any command output you can follow). Every line must carry **what your model decided**
+(either intent + slot, or one of the 93 command phrases, see below) and two timing fields:
 
 | Field | Meaning | Required |
 |---|---|---|
@@ -150,6 +150,25 @@ audio_ms = len(audio) / sample_rate * 1000
 print(json.dumps({"intent": intent, "slot": slot,
                   "infer_ms": round(infer_ms, 1), "audio_ms": round(audio_ms)}), file=log, flush=True)
 ```
+
+### If your model outputs the 93 classes
+
+Print the phrase it chose, exactly as in [`vcmbench/variations.csv`](vcmbench/variations.csv)
+(case and punctuation don't matter), or its row number there, counting from 0:
+
+```
+{"variation": "Set the temperature to 22 degrees", "infer_ms": 85, "audio_ms": 1500}
+variation=Set the temperature to 22 degrees infer_ms=85 audio_ms=1500
+{"variation_id": 64, "infer_ms": 85, "audio_ms": 1500}
+{"variation": "OUT_OF_SCOPE", "infer_ms": 85, "audio_ms": 1500}
+```
+
+The phrase is turned into its intent and slot (here TEMPERATURE, 22 degrees), so every metric works
+the same as for intent + slot models. The 93-command scores use **the same rule for everyone**
+(intent and slot right, wording not judged), so all students stay comparable. On top of that, the
+report shows an **exact wording** accuracy for 93-class models: the chosen phrase must be the one
+that was spoken. Use `variation_id` only if your class order is the same as `variations.csv`; if
+not, print the phrase. A phrase that is not one of the 93 is scored wrong and listed in the report.
 
 The real-time factor in the report is `infer_ms / audio_ms`. The sound check refuses to start
 the test until both fields are present (you can override it, and the report then marks timing

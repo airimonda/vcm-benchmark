@@ -329,3 +329,39 @@ def test_breakdowns_overall_real_synthetic():
     md = render_markdown(m)
     assert "Overall vs real vs synthetic" in md and "synthetic voice" in md
     assert md.index("## At a glance") < md.index("# Detailed metrics") < md.index("## Classification")
+
+
+# ---------------------------------------------------------------- 93-class output
+
+@pytest.mark.parametrize("line,expect", [
+    ('{"variation": "Set the temperature to 22 degrees", "infer_ms": 50, "audio_ms": 1500}',
+     ("TEMPERATURE", "22 degrees", "Set the temperature to 22 degrees")),
+    ('{"intent": "Wake me up at 9:00 PM", "infer_ms": 5, "audio_ms": 1000}',
+     ("ALARM", "9:00 PM", "Wake me up at 9:00 PM")),
+    ('{"variation_id": 0, "infer_ms": 5, "audio_ms": 1000}', ("PLAY_MUSIC", "", "Play music")),
+    ("variation=change color to blue infer_ms=40 audio_ms=1500", ("COLOR", "Blue", "Change color to Blue")),
+    ('{"variation": "OUT_OF_SCOPE", "infer_ms": 5, "audio_ms": 1000}', ("OUT_OF_SCOPE", "", "")),
+    ("intent=TIMER slot=30 seconds infer_ms=40 audio_ms=1500", ("TIMER", "30 seconds", "")),
+])
+def test_93_class_output(line, expect):
+    e = P.LineParser().parse(line, 0)
+    i, s, known, v = S.resolve_prediction(e.intent, e.slot, e.variation, S.build_alias_table())
+    assert (i, s, v) == expect and known
+    assert e.infer_ms is not None and e.audio_ms is not None
+
+
+def test_93_class_unknown_phrase_is_flagged():
+    i, _, known, v = S.resolve_prediction("", "", "Change the lights to Blue", S.build_alias_table())
+    assert i.startswith("OTHER:") and not known and v == ""
+
+
+def test_score_exact_wording():
+    t1 = _trial("TEMPERATURE", "Temperature 22 degrees", "22 degrees", "TEMPERATURE", "22 degrees",
+                pred_variation="Set the temperature to 22 degrees")       # right command, other wording
+    t2 = _trial("TIME", "Time", "", "TIME", "", pred_variation="Time")
+    t3 = _trial("PAUSE", "Pause", "", "STOP", "", pred_variation="Stop")
+    m = score([t1, t2, t3], [], {}, None, 0, 10, {})
+    assert m["command_level"]["accuracy"] == pytest.approx(2 / 3)          # same rule as everyone
+    assert m["exact_wording"]["accuracy"] == pytest.approx(1 / 3)          # wording must match too
+    assert ("Pause", "Stop") in [c for c, _ in m["command_level"]["confusions"]]
+    assert "93-class output" in render_markdown(m)

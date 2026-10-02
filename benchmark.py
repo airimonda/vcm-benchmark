@@ -382,6 +382,8 @@ def manual_answer(prompt_extra: str = "") -> tuple[str, str]:
             continue
         if not a:
             return S.NONE, ""
+        if S.match_variation(a) is not None and not a.strip().isdigit():
+            return a, ""                         # one of the 93 phrases typed in full
         if a.lower() in ("o", "oos"):
             return S.OOS, ""
         head, _, slot = a.partition(" ")
@@ -426,12 +428,15 @@ def collect(t: dict, link, aliases: dict, wait_until: float, events_pool: list) 
     t["wake_logged"] = any(e.kind == "wake" for e in evs)
     if cmds:
         e = cmds[0]
-        intent, slot, known = S.normalize_prediction(e.intent, e.slot, aliases)
-        t.update(pred_intent=intent, pred_slot=slot, pred_raw=e.raw or f"{e.intent} {e.slot}".strip(),
+        intent, slot, known, variation = S.resolve_prediction(e.intent, e.slot, getattr(e, "variation", ""),
+                                                              aliases)
+        t.update(pred_intent=intent, pred_slot=slot, pred_variation=variation,
+                 pred_raw=e.raw or f"{e.intent} {e.slot}".strip(),
                  infer_ms=e.infer_ms, audio_ms=e.audio_ms,
                  latency_s=(e.t - t["cmd_end_abs"]) if not link.manual else None)
     else:
-        t.update(pred_intent=S.NONE, pred_slot="", pred_raw="", infer_ms=None, audio_ms=None, latency_s=None)
+        t.update(pred_intent=S.NONE, pred_slot="", pred_variation="", pred_raw="", infer_ms=None, audio_ms=None,
+                 latency_s=None)
 
 
 class S_Event:  # tiny stand-in for manual answers
@@ -466,6 +471,8 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
                 for _, line in new[-6:]:
                     info(f"    | {line[:120]}")
             got = f"{t['pred_intent']} {t['pred_slot']}".strip()
+            if t.get("pred_variation"):
+                got += f"  (93-class: '{t['pred_variation']}')"
             info(f"  -> understood as: {got}" + ("  (OK)" if t["pred_intent"] == t["true_intent"] else ""))
             if t["n_command_events"] and not link.manual:
                 missing = [k for k in ("infer_ms", "audio_ms") if t.get(k) is None]

@@ -43,6 +43,30 @@ VARIATIONS = load_variations()
 VARIATION_BY_PHRASE = {v.phrase.lower(): v for v in VARIATIONS}
 assert len(VARIATIONS) == 93, len(VARIATIONS)
 
+
+def _phrase_key(text: str) -> str:
+    """Phrase comparison key: lowercase, punctuation dropped, single spaces."""
+    return " ".join(re.sub(r"[^a-z0-9 ]+", "", str(text).lower().replace("_", " ")).split())
+
+
+VARIATION_BY_KEY = {_phrase_key(v.phrase): v for v in VARIATIONS}
+assert len(VARIATION_BY_KEY) == 93
+
+
+def match_variation(value) -> Variation | None:
+    """A 93-class prediction -> its Variation.
+
+    Accepts the phrase itself ("Set the temperature to 22 degrees", any case,
+    punctuation ignored) or `variation_id` = 0-based row number in
+    vcmbench/variations.csv (as int or digit string).
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
+        i = int(value)
+        return VARIATIONS[i] if 0 <= i < len(VARIATIONS) else None
+    return VARIATION_BY_KEY.get(_phrase_key(value))
+
 # Common names other runtimes use. Keys are already normalised (see _key).
 BUILTIN_ALIASES = {
     "PLAY": "PLAY_MUSIC", "MUSIC": "PLAY_MUSIC", "PLAY_SONG": "PLAY_MUSIC", "START_MUSIC": "PLAY_MUSIC",
@@ -110,6 +134,26 @@ def normalize_prediction(intent: str | None, slot: str | None,
             tail = " ".join(parts[n:]).lower()
             return aliases[head], slot or tail, True
     return f"OTHER:{k}", slot, False
+
+
+def resolve_prediction(intent: str | None, slot: str | None, variation, aliases: dict[str, str]
+                       ) -> tuple[str, str, bool, str]:
+    """Like normalize_prediction, but also accepts a 93-class output.
+
+    `variation` (or an `intent` that is itself one of the 93 phrases) is turned
+    into its intent + slot value. Returns (intent, slot, known, variation phrase
+    or "").
+    """
+    v = match_variation(variation) if variation not in (None, "") else None
+    if v is None and intent and " " in str(intent).strip():
+        v = match_variation(intent)
+    if v is not None:
+        return v.intent, v.value, True, v.phrase
+    if not intent and variation not in (None, ""):
+        # not one of the 93 phrases: an alias like "OUT_OF_SCOPE", else flagged as unknown
+        intent = str(variation)
+    i, s, known = normalize_prediction(intent, slot, aliases)
+    return i, s, known, ""
 
 
 def variations_for(intent: str, value: str = "") -> list[Variation]:
