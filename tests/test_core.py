@@ -331,6 +331,48 @@ def test_breakdowns_overall_real_synthetic():
     assert md.index("## At a glance") < md.index("# Detailed metrics") < md.index("## Classification")
 
 
+# ---------------------------------------------------------------- mic check
+
+def _speech(level, n=A.SR):
+    return (level * np.sin(np.arange(n) / 5) * np.hanning(n)).astype(np.float32)
+
+
+@pytest.mark.parametrize("level,verdict", [(0.3, "ok"), (0.03, "weak"), (0.004, "not heard"), (1.5, "clipping")])
+def test_mic_levels(level, verdict):
+    rng = np.random.default_rng(0)
+    ambient = (0.002 * rng.standard_normal(2 * A.SR)).astype(np.float32)
+    rec = np.concatenate([ambient, np.clip(_speech(level) + ambient[: A.SR], -1, 1)])
+    assert A.mic_levels(ambient, rec)["verdict"] == verdict
+
+
+def test_mic_check_flow(tmp_path, monkeypatch):
+    import benchmark as B
+    monkeypatch.setattr(B, "YES", True)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    A.save(tmp_path / "t.wav", _speech(0.3))
+    rng = np.random.default_rng(1)
+
+    class FakeLink(P.SshLink):
+        def __init__(self):
+            self.specs = {"audio_inputs": "card 2: Device [USB PnP Sound Device], device 0: USB Audio [USB Audio]"}
+
+        def record(self, seconds, device="default"):
+            noise = (0.002 * rng.standard_normal(int(seconds * A.SR))).astype(np.float32)
+            if seconds > 2:
+                noise[: A.SR] += _speech(0.3)
+            return noise
+
+    class FakePlayer:
+        def play(self, x):
+            return 0.0
+
+    cfg = {}
+    trials = [{"kind": "no_wake", "audio_file": "t.wav"}]
+    B.mic_check(None, cfg, FakeLink(), FakePlayer(), tmp_path, trials)
+    assert cfg["mic_check"]["verdict"] == "ok" and cfg["pi_mic"] == "default"
+    assert B.pi_mics(FakeLink().specs)[1][0] == "plughw:2,0"
+
+
 # ---------------------------------------------------------------- 93-class output
 
 @pytest.mark.parametrize("line,expect", [

@@ -73,7 +73,14 @@ The script walks you through these steps:
    one per intent; your Pi should ignore them. All trials are **shuffled** with a **seed you
    choose** (a random one is suggested; type the same seed again to repeat a test exactly, or use
    a seed the class agrees on so everyone hears the same order).
-4. **Sound check**: two warm-up commands, not scored. You see the log lines your Pi printed and
+4. **Mic check** (SSH connection): the Pi records 2 s of room noise with `arecord`, then records
+   again while the laptop plays a command without the wake word. The laptop measures room noise,
+   laptop speech level, signal-to-noise ratio and clipping, and says **OK / weak / not heard /
+   clipping** with what to change (volume, distance, or another Pi microphone; you can pick one
+   from the Pi's `arecord -l` list). Repeat until it passes. If your assistant holds the mic
+   exclusively ("device busy"), use the `default` input or stop the assistant for the check.
+   The result goes in the report header.
+   **Sound check**: two warm-up commands, not scored. You see the log lines your Pi printed and
    how they were understood. Fix the volume or the output format here.
 5. **Approve**: every remaining question comes now: ONNX model path (optional), and whether to
    delete the generated audio at the end. You see the plan (number of commands, duration,
