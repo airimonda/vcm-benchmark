@@ -68,7 +68,8 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         yt_c.append(M.REJECT if truth_oos else t["true_variation"])
         intent_ok = pred == t["true_intent"]
         yp_c.append(M.command_label(pred, t.get("pred_slot") or "",
-                                    t["true_variation"] if intent_ok else None, slot_ok and intent_ok))
+                                    t["true_variation"] if intent_ok else None, slot_ok and intent_ok,
+                                    t.get("pred_variation") or ""))
         t["y_intent"] = (yt_i[-1], yp_i[-1])
         t["y_command"] = (yt_c[-1], yp_c[-1])
         t["correct_intent"] = yt_i[-1] == yp_i[-1]
@@ -79,6 +80,15 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
     for g in ("real voice", "synthetic voice"):
         breakdowns[g] = group_metrics([t for t in trials if _voice(t) == g], [t for t in no_wake if _voice(t) == g])
 
+    # 93-class models: also score the exact phrase they chose (wording must match too)
+    exact = None
+    if any(t.get("pred_variation") for t in trials):
+        yt = [M.REJECT if t["true_intent"] == OOS else t["true_variation"] for t in trials]
+        yp = [t["pred_variation"] if t.get("pred_variation")
+              else M.REJECT if t["pred_intent"] in (OOS, NONE)
+              else f"{t['pred_intent']} (no phrase)" for t in trials]
+        exact = M.classification_report(yt, yp)
+        exact["lines_with_phrase"] = sum(bool(t.get("pred_variation")) for t in trials)
     any_wake_log = any(t.get("wake_logged") for t in trials)
     responded = [t for t in trials if t["n_command_events"] > 0]
     no_timing = sum(t.get("infer_ms") is None or not t.get("audio_ms") for t in responded)
@@ -91,6 +101,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         "model": model_profile,
         "intent_level": M.classification_report(yt_i, yp_i),
         "command_level": M.classification_report(yt_c, yp_c),
+        "exact_wording": exact,
         "false_wake": false_wake,
         "slots": M.slot_report(slot_rows),
         "breakdowns": breakdowns,
@@ -267,6 +278,13 @@ def render_markdown(m: dict) -> str:
     if p["unknown_intent_names"]:
         out += [f"**Unknown intent names from the Pi (scored wrong; add aliases):** "
                 f"{', '.join(p['unknown_intent_names'])}", ""]
+    E = m.get("exact_wording")
+    if E:
+        out += [f"**93-class output:** {E['lines_with_phrase']} command line(s) named one of the 93 phrases. "
+                f"Exact wording (the chosen phrase must be the spoken one): accuracy {_fmt(E['accuracy'], True)} "
+                f"{_ci(E['accuracy_ci95'])}, balanced {_fmt(E['balanced_accuracy'], True)}, "
+                f"F1 {_fmt(E['macro_f1'], True)}, F2 {_fmt(E['macro_f2'], True)}. The 93-command column above "
+                "uses the same rule as for every student (intent + slot right), so it stays comparable.", ""]
     out += render_breakdowns(m.get("breakdowns") or {})
 
     out += ["## Slot values (slotted intents, intent right)", "",
@@ -338,7 +356,7 @@ def render_markdown(m: dict) -> str:
 
 
 TRIAL_COLUMNS = ["order", "kind", "false_wake", "clip_idx", "accent_group", "transcript", "true_intent", "true_variation", "true_slot",
-                 "pred_intent", "pred_slot", "pred_raw", "correct_intent", "correct_command",
+                 "pred_intent", "pred_slot", "pred_variation", "pred_raw", "correct_intent", "correct_command",
                  "slot_exact", "slot_abs_error", "slot_phonetic_dist", "n_command_events", "wake_logged",
                  "latency_s", "infer_ms", "audio_ms", "speaker_id", "is_synthetic", "wake_take", "audio_file"]
 

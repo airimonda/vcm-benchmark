@@ -40,12 +40,15 @@ _INTENT_RE = re.compile(_KEY + r"[\"']?\s*[=:]\s*[\"']?(?P<intent>[A-Za-z][A-Za-
 # slot value runs until a delimiter or the next "key=" / "key:"
 _SLOT_RE = re.compile(r"\b(?:slot_value|slot|value)[\"']?\s*[=:]\s*[\"']?(?P<slot>.+?)[\"']?"
                       r"(?=\s*[,;|}\)\]]|\s+[A-Za-z_]+\s*[=:]|\s*$)", re.I)
+_VAR_RE = re.compile(r"\b(?:variation|variation_id|phrase|command_class)[\"']?\s*[=:]\s*[\"']?(?P<v>.+?)[\"']?"
+                     r"(?=\s*[,;|}\)\]]|\s+[A-Za-z_]+\s*[=:]|\s*$)", re.I)
 _INFER_RE = re.compile(r"(?:infer(?:ence)?_?ms|latency_?ms|model_?ms)[\"']?\s*[=:]\s*(?P<v>[0-9.]+)", re.I)
 _AUDIO_RE = re.compile(r"(?:audio|window|utterance)_?ms[\"']?\s*[=:]\s*(?P<v>[0-9.]+)", re.I)
 DEFAULT_WAKE_REGEX = r"(?i)\b(wake[ _-]?word|wake detected|woke|hotword|wake=1|listening)\b"
 
 _JSON_INTENT_KEYS = ("intent", "command", "cmd", "label", "prediction", "pred", "action")
 _JSON_SLOT_KEYS = ("slot", "slot_value", "value", "slots")
+_JSON_VARIATION_KEYS = ("variation", "variation_id", "phrase", "command_class")
 _JSON_INFER_KEYS = ("infer_ms", "inference_ms", "latency_ms", "model_ms")
 _JSON_AUDIO_KEYS = ("audio_ms", "window_ms", "utterance_ms")
 
@@ -59,6 +62,7 @@ class Event:
     infer_ms: float | None = None
     audio_ms: float | None = None
     raw: str = ""
+    variation: str = ""       # 93-class output (phrase or variation_id), if the Pi printed one
 
 
 class LineParser:
@@ -88,16 +92,17 @@ class LineParser:
                     return ev
         if self.command_re is not None:          # the student's own regex
             m = self.command_re.search(s)
-            if m and m.groupdict().get("intent"):
+            if m and (m.groupdict().get("intent") or m.groupdict().get("variation")):
                 g = m.groupdict()
-                return Event("command", t, g["intent"].strip(), (g.get("slot") or "").strip(),
-                             _f(g.get("infer_ms")), _f(g.get("audio_ms")), s)
+                return Event("command", t, (g.get("intent") or "").strip(), (g.get("slot") or "").strip(),
+                             _f(g.get("infer_ms")), _f(g.get("audio_ms")), s, (g.get("variation") or "").strip())
         else:
-            m = _INTENT_RE.search(s)
-            if m:
+            m, vm = _INTENT_RE.search(s), _VAR_RE.search(s)
+            if m or vm:
                 sm, im, am = _SLOT_RE.search(s), _INFER_RE.search(s), _AUDIO_RE.search(s)
-                return Event("command", t, m.group("intent"), sm.group("slot").strip() if sm else "",
-                             _f(im and im.group("v")), _f(am and am.group("v")), s)
+                return Event("command", t, m.group("intent") if m else "", sm.group("slot").strip() if sm else "",
+                             _f(im and im.group("v")), _f(am and am.group("v")), s,
+                             vm.group("v").strip() if vm else "")
         if self.wake_re.search(s):
             return Event("wake", t, raw=s)
         return None
@@ -105,13 +110,17 @@ class LineParser:
     def _from_json(self, o: dict, t: float, raw: str) -> Event | None:
         kind = str(o.get("event") or o.get("type") or "").lower()
         intent = next((o[k] for k in _JSON_INTENT_KEYS if o.get(k) not in (None, "")), None)
+        variation = next((o[k] for k in _JSON_VARIATION_KEYS if o.get(k) not in (None, "")), None)
+        if intent is None and variation is not None:
+            intent = ""
         if intent is not None and not isinstance(intent, (dict, list)):
             slot = next((o[k] for k in _JSON_SLOT_KEYS if o.get(k) not in (None, "")), "")
             if isinstance(slot, dict):
                 slot = " ".join(str(v) for v in slot.values())
             infer = next((o[k] for k in _JSON_INFER_KEYS if o.get(k) is not None), None)
             audio = next((o[k] for k in _JSON_AUDIO_KEYS if o.get(k) is not None), None)
-            return Event("command", t, str(intent), str(slot), _f(infer), _f(audio), raw)
+            return Event("command", t, str(intent), str(slot), _f(infer), _f(audio), raw,
+                         "" if variation is None else str(variation))
         if "wake" in kind or o.get("wake") in (True, 1, "1"):
             return Event("wake", t, raw=raw)
         return None
