@@ -56,28 +56,39 @@ On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard li
 
 ## Before you start
 
-Before you run the benchmark:
-
-1. **Your Pi is already connected** to this laptop (however you connected it) and you can log in
-   with `ssh user@host`, e.g. `ssh name@raspberrypi`, without typing a password.
-
-2. **Your assistant appends one line per command to `~/vcm_benchmark.log` on the Pi** (the
-   default; another path works too, the script asks). Format: see
-   [What your Pi must print](#what-your-pi-must-print). Minimal version:
+1. **Your Pi is connected** to the laptop's network (same Wi-Fi, hotspot, Tailscale, cable ...).
+2. **Your assistant writes one line per command to a log file in `~/vcm_benchmark/` on the Pi**,
+   named `<id>_<date-time>.log` (a new file each time your assistant starts). The benchmark reads
+   the newest file there. Format: see [What your Pi must print](#what-your-pi-must-print).
+   Minimal version:
 
    ```python
-   import json, os
-   log = open(os.path.expanduser("~/vcm_benchmark.log"), "a", buffering=1)
+   import datetime, json, os
+   os.makedirs(os.path.expanduser("~/vcm_benchmark"), exist_ok=True)
+   log = open(os.path.expanduser(f"~/vcm_benchmark/{STUDENT_ID}_{datetime.datetime.now():%Y%m%d-%H%M%S}.log"),
+              "a", buffering=1)
    # after each decision:
    print(json.dumps({"intent": intent, "slot": slot, "infer_ms": infer_ms, "audio_ms": audio_ms}),
          file=log, flush=True)
    ```
 
-3. **Your assistant is running** on the Pi, and the laptop speaker is about 1 m from the Pi's mic.
+3. **Your assistant is running**, and the laptop speaker is about 1 m from the Pi's mic.
 
-The script then asks only two things about the Pi: how you log in (`user@host`, or paste the whole
-`ssh ...` command) and the log file (Enter for the default). It finds your assistant's process by
-itself (the process that has the log file open) to report its CPU and RAM.
+How the script reaches the Pi (no setup questions unless needed):
+
+1. It tries to log in over SSH by itself, without a password: the Pi you used last time, Pi
+   entries in your `~/.ssh/config`, and `raspberrypi.local`. It picks the one that has
+   `~/vcm_benchmark/`.
+2. If that fails, it shows what went wrong for each address (not found, no answer, needs a
+   password, SSH off ...) and offers:
+   * **log in with your username and password**: type `user@host` (or paste your whole
+     `ssh ...` command) and your password when asked;
+   * **let the Pi send its data**: paste one line in a terminal on the Pi; it downloads the small
+     agent from this repo and sends to the laptop. Works on networks where the laptop cannot
+     reach the Pi.
+
+It finds your assistant's process by itself (the one with the log file open) to report its CPU
+and RAM.
 
 ## Run
 
@@ -138,25 +149,26 @@ local copy.
 Your answers are saved in `bench_settings.json`, so the next run asks fewer questions
 (`--fresh` to start over). Interrupted? `python benchmark.py --resume runs/<run-id>`.
 
-## Other ways to connect (advanced)
+## Options (advanced)
 
-The guide assumes SSH (see [Before you start](#before-you-start)). If SSH is impossible:
-
-| Flag | Use when |
+| Flag | What it does |
 |---|---|
-| `--mode http` | the laptop cannot reach the Pi but the Pi can reach the laptop: run the printed `python3 pi_agent.py --post http://LAPTOP_IP:8765 ...` on the Pi |
-| `--mode manual` | no network at all: after each command you type what the Pi did (`TIMER 30 seconds`, Enter = nothing) |
+| `--host user@host` | skip the search and use this Pi (SSH) |
+| `--mode http` | go straight to "the Pi sends its data" (paste one line on the Pi) |
+| `--mode manual` | no network at all: after each command you type what the Pi did |
 | `--mode sim` | no Pi, to try the script |
+| `--log-dir DIR` | another log folder on the Pi (newest `.log` is read) |
+| `--log FILE` | one fixed log file instead of the folder |
+| `--log-cmd "CMD"` | follow a command's output, e.g. `journalctl --user -u myassistant -f -n 0 -o cat` |
+| `--proc REGEX` | choose the process to measure yourself |
+| `--ssh-opt=-p2222` | extra ssh option |
 
-Other options: `--host user@host`, `--log PATH`, `--log-cmd "journalctl --user -u myassistant -f -n 0 -o cat"`
-(follow a command's output instead of a file; or type `!` + the command at the log question),
-`--proc REGEX` (pick the process to measure yourself), `--ssh-opt=-p2222`.
-For SSH, the script copies `pi_agent.py` to `~/.vcm_bench/` on the Pi and runs it there.
+Over SSH, the script copies `pi_agent.py` to `~/.vcm_bench/` on the Pi and runs it there.
 
 ## What your Pi must print
 
-Your assistant must append **one line per recognised command** to a log file on the Pi
-(default `~/vcm_benchmark.log`). Every line must carry **what your model decided**
+Your assistant must append **one line per recognised command** to a log file on the Pi, in
+`~/vcm_benchmark/` (the newest `.log` there is read; see [Before you start](#before-you-start)). Every line must carry **what your model decided**
 (either intent + slot, or one of the 93 command phrases, see below) and two timing fields:
 
 | Field | Meaning | Required |
@@ -182,7 +194,7 @@ t0 = time.perf_counter()
 intent, slot = model.predict(audio)            # your features + model
 infer_ms = (time.perf_counter() - t0) * 1000
 audio_ms = len(audio) / sample_rate * 1000
-log = open(os.path.expanduser("~/vcm_benchmark.log"), "a", buffering=1)   # open once at start
+log = open(os.path.expanduser("~/vcm_benchmark/myid_20261002-140000.log"), "a", buffering=1)  # once at start
 print(json.dumps({"intent": intent, "slot": slot,
                   "infer_ms": round(infer_ms, 1), "audio_ms": round(audio_ms)}), file=log, flush=True)
 ```

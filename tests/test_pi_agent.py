@@ -159,3 +159,63 @@ def test_find_log_writers(tmp_path):
         assert writer.pid in pids
     finally:
         writer.kill()
+
+
+def _start_dir_agent(d):
+    return subprocess.Popen([sys.executable, AGENT, "--log-dir", str(d), "--interval", "0.2"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            universal_newlines=True)
+
+
+def _stop(p):
+    try:
+        p.stdin.close()
+        p.wait(timeout=5)
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+def _has_line(s, text):
+    return any(m["type"] == "log" and m["line"] == text for m in s)
+
+
+def test_log_dir_follows_newest(tmp_path):
+    old = tmp_path / "old.log"
+    old.write_text("old line\n")
+    p = _start_dir_agent(tmp_path)
+    try:
+        seen = read_until(p, lambda s: any(m["type"] == "log_file" for m in s))
+        assert [m["path"] for m in seen if m["type"] == "log_file"] == [str(old)]
+        with open(str(old), "a") as f:
+            f.write("a1\n")
+        seen = read_until(p, lambda s: _has_line(s, "a1"))
+        assert _has_line(seen, "a1")
+        assert not _has_line(seen, "old line")
+        time.sleep(0.1)
+        new = tmp_path / "b.log"
+        new.write_text("b0\n")
+        os.utime(str(new), (time.time() + 5, time.time() + 5))
+        with open(str(new), "a") as f:
+            f.write("b1\n")
+        seen = read_until(p, lambda s: _has_line(s, "b0") and _has_line(s, "b1"))
+        logs = [m for m in seen if m["type"] == "log" and m["line"] in ("b0", "b1")]
+        assert [m["line"] for m in logs] == ["b0", "b1"]
+        assert all(m["path"].endswith("b.log") for m in logs)
+        assert any(m["type"] == "log_file" and m["path"].endswith("b.log") for m in seen)
+    finally:
+        _stop(p)
+
+
+def test_log_dir_missing_at_start(tmp_path):
+    d = tmp_path / "later"
+    p = _start_dir_agent(d)
+    try:
+        read_until(p, lambda s: any(m["type"] == "metrics" for m in s))
+        d.mkdir()
+        (d / "x.log").write_text("x1\n")
+        seen = read_until(p, lambda s: _has_line(s, "x1"))
+        assert _has_line(seen, "x1")
+        assert any(m["type"] == "log_file" and m["path"].endswith("x.log") for m in seen)
+    finally:
+        _stop(p)

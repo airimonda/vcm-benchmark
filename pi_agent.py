@@ -15,6 +15,11 @@ mode and it will push everything to the laptop over HTTP:
 Options:
     --specs-only      print one "specs" JSON line and exit
     --log PATH        tail this file (repeatable); only NEW lines are reported
+    --log-dir DIR     follow the newest *.log file directly inside DIR (repeatable;
+                      DIR may not exist yet). On start the newest file is read
+                      from its end; each newer file (a new run of your assistant)
+                      is read from its beginning and followed instead, announced
+                      with a "log_file" message
     --log-cmd CMD     run CMD in a shell (repeatable) and report each output line
                       (stdout+stderr) as a log with path "cmd:CMD"; restarted
                       2 s after it exits, e.g. "journalctl --user -u vcm -f -n 0 -o cat"
@@ -26,7 +31,7 @@ Options:
                       URL/ping
 
 Output (stdout mode): one JSON object per line, each with "type" and "t"
-(Pi time.time()). Types: specs, metrics, log, pong, clock (post mode), error.
+(Pi time.time()). Types: specs, metrics, log, log_file, pong, clock (post mode), error.
 stdin commands (stdout mode): "ping <id>" -> pong reply; "quit" or EOF -> exit.
 Ctrl-C or SIGTERM also exit cleanly.
 
@@ -43,6 +48,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -297,15 +303,22 @@ def find_pids(regex, own):
 
 
 def find_log_writers(paths, own):
-    """PIDs that have one of the log files open: the assistant writing its log."""
+    """PIDs that have one of the log files open: the assistant writing its log.
+
+    A directory target matches any file directly inside that directory."""
     targets = set()
+    dirs = set()
     for p in paths:
         try:
-            targets.add(os.path.realpath(os.path.expanduser(p)))
+            real = os.path.realpath(os.path.expanduser(p))
+            if os.path.isdir(real):
+                dirs.add(real)
+            else:
+                targets.add(real)
         except Exception:
             pass
     pids = []
-    if not targets:
+    if not targets and not dirs:
         return pids
     try:
         names = os.listdir("/proc")
@@ -317,7 +330,8 @@ def find_log_writers(paths, own):
         try:
             for fd in os.listdir("/proc/%s/fd" % n):
                 try:
-                    if os.readlink("/proc/%s/fd/%s" % (n, fd)) in targets:
+                    link = os.readlink("/proc/%s/fd/%s" % (n, fd))
+                    if link in targets or (dirs and os.path.dirname(link) in dirs):
                         pids.append(int(n))
                         break
                 except OSError:
@@ -346,12 +360,13 @@ def proc_stat(pid):
         return None
 
 
-def metrics_loop(interval, pattern, log_paths=()):
+def metrics_loop(interval, pattern, log_paths=(), log_dirs=()):
     try:
         regex = re.compile(pattern) if pattern else None
     except re.error as e:
         emit_error("proc", "bad regex: %s" % e)
         regex = None
+    log_paths = tuple(log_paths) + tuple(log_dirs)
     own = set([os.getpid(), os.getppid()])
     try:
         hz = os.sysconf("SC_CLK_TCK")
@@ -476,6 +491,82 @@ def tail_loop(path):
         emit_error("log:" + path, e)
 
 
+def _newest_log(dirpath):
+    """Newest regular *.log file directly inside dirpath (mtime, then name) or None."""
+    best = None
+    try:
+        names = os.listdir(dirpath)
+    except OSError:
+        return None
+    for n in names:
+        if not n.endswith(".log"):
+            continue
+        full = os.path.join(dirpath, n)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        key = (st.st_mtime, n)
+        if best is None or key > best[0]:
+            best = (key, full)
+    return best[1] if best else None
+
+
+def dir_loop(dirpath):
+    real = os.path.expanduser(dirpath)
+    cur = None      # path being followed
+    fh = None
+    pos = 0
+    buf = b""
+    first = True    # the very first file found is read from its end, later ones from the start
+    next_scan = 0.0
+    try:
+        while not STOP.is_set():
+            if time.time() >= next_scan:
+                next_scan = time.time() + 0.5
+                newest = _newest_log(real)
+                if newest is not None and newest != cur:
+                    if fh:
+                        fh.close()
+                        fh = None
+                    try:
+                        fh = open(newest, "rb")
+                    except OSError:
+                        fh = None
+                    if fh is not None:
+                        cur = newest
+                        buf = b""
+                        pos = fh.seek(0, os.SEEK_END) if first else 0
+                        emit({"type": "log_file", "path": cur})
+                first = False
+            if fh is None:
+                STOP.wait(0.02)
+                continue
+            try:
+                size = os.fstat(fh.fileno()).st_size
+                if size < pos:
+                    fh.seek(0)
+                    pos = 0
+                    buf = b""
+                data = fh.read()
+            except (OSError, ValueError):
+                data = b""
+            if data:
+                pos += len(data)
+                now = time.time()
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", "replace").rstrip("\r")
+                    emit({"type": "log", "path": cur, "line": text, "t": now})
+            else:
+                STOP.wait(0.02)
+    except Exception as e:
+        emit_error("log-dir:" + dirpath, e)
+
+
 # ---------------------------------------------------------------- log commands
 _children = []
 _children_lock = threading.Lock()
@@ -553,6 +644,36 @@ def http_post(url, obj):
         resp.close()
 
 
+def _says_stop(body):
+    """The laptop answers {"stop": true} when the test is over."""
+    try:
+        return bool(json.loads(body.decode("utf-8")).get("stop"))
+    except Exception:
+        return False
+
+
+def pick_base(post_arg):
+    """--post may list several laptop addresses (comma-separated); use the first that answers."""
+    bases = [b.strip().rstrip("/") for b in post_arg.split(",") if b.strip()]
+    shown = 0.0
+    while not STOP.is_set():
+        for b in bases:
+            try:
+                http_post(b + "/ping", {"id": "probe", "t": time.time()})
+                sys.stderr.write("vcm-benchmark: connected to the laptop at %s. Leave this running;\n"
+                                 "it stops by itself when the test ends.\n" % b)
+                sys.stderr.flush()
+                return b
+            except Exception:
+                continue
+        if time.time() - shown > 15:
+            sys.stderr.write("vcm-benchmark: waiting for the laptop (%s) ...\n" % ", ".join(bases))
+            sys.stderr.flush()
+            shown = time.time()
+        STOP.wait(2.0)
+    return bases[0] if bases else ""
+
+
 def sender_loop(base):
     url = base.rstrip("/") + "/event"
     backoff = 0.0
@@ -564,7 +685,9 @@ def sender_loop(base):
                 batch.append(_queue.popleft())
         if batch:
             try:
-                http_post(url, batch)
+                if _says_stop(http_post(url, batch)):
+                    sys.stderr.write("vcm-benchmark: test finished, stopping.\n")
+                    STOP.set()
                 backoff = 0.0
             except Exception:
                 with _queue_lock:
@@ -592,6 +715,9 @@ def clock_loop(base):
             t0 = time.time()
             body = http_post(url, {"id": "%s-%d" % (socket.gethostname(), n), "t": t0})
             t1 = time.time()
+            if _says_stop(body):
+                STOP.set()
+                return
             server_t = float(json.loads(body.decode("utf-8"))["t"])
             emit({"type": "clock", "offset_s": server_t - (t0 + t1) / 2.0,
                   "rtt_s": t1 - t0})
@@ -611,6 +737,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Raspberry Pi benchmark agent")
     ap.add_argument("--specs-only", action="store_true")
     ap.add_argument("--log", action="append", default=[])
+    ap.add_argument("--log-dir", action="append", default=[])
     ap.add_argument("--log-cmd", action="append", default=[])
     ap.add_argument("--proc")
     ap.add_argument("--interval", type=float, default=1.0)
@@ -641,6 +768,7 @@ def main(argv=None):
     emit(specs)
     sender = None
     if _post_mode:
+        args.post = pick_base(args.post)
         sender = threading.Thread(target=sender_loop, args=(args.post,))
         sender.daemon = True
         sender.start()
@@ -649,9 +777,12 @@ def main(argv=None):
         start(stdin_loop)
     for p in args.log:
         start(tail_loop, p)
+    for d in args.log_dir:
+        start(dir_loop, d)
     for c in args.log_cmd:
         start(cmd_loop, c)
-    start(metrics_loop, max(0.05, args.interval), args.proc, tuple(args.log))
+    start(metrics_loop, max(0.05, args.interval), args.proc, tuple(args.log),
+          tuple(args.log_dir))
 
     while not STOP.wait(0.2):
         pass

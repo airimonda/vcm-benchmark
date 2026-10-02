@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 AGENT_PATH = Path(__file__).resolve().parent.parent / "pi_agent.py"
+AGENT_URL = "https://raw.githubusercontent.com/airimonda/vcm-benchmark/main/pi_agent.py"
 REMOTE_AGENT = "~/.vcm_bench/pi_agent.py"
 
 
@@ -147,6 +148,7 @@ class PiLink:
     offset: float = 0.0          # pi_clock - laptop_clock
     rtt: float | None = None
     manual: bool = False
+    log_file: str = ""           # the Pi log file being read (newest file in the log folder)
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
@@ -169,6 +171,8 @@ class PiLink:
         elif typ == "clock":          # sent by the agent in --post mode
             self.offset = -float(msg["offset_s"])
             self.rtt = float(msg["rtt_s"])
+        elif typ == "log_file":
+            self.log_file = str(msg.get("path", ""))
         elif typ == "error":
             self.errors.append(msg)
 
@@ -181,8 +185,10 @@ class PiLink:
                 return out
 
     def agent_args(self, logs: list[str], log_cmds: list[str], proc: str | None,
-                   interval: float) -> list[str]:
+                   interval: float, log_dirs: list[str] = ()) -> list[str]:
         a = ["--interval", str(interval)]
+        for d in log_dirs:
+            a += ["--log-dir", d]
         for p in logs:
             a += ["--log", p]
         for c in log_cmds:
@@ -195,7 +201,7 @@ class PiLink:
 class SshLink(PiLink):
     def __init__(self, parser: LineParser, target: str, ssh_opts: list[str], control_dir: Path,
                  logs: list[str], log_cmds: list[str], proc: str | None, interval: float = 1.0,
-                 python: str = "python3"):
+                 python: str = "python3", log_dirs: list[str] = ()):
         super().__init__(parser)
         self.target = target
         self.python = python
@@ -208,7 +214,7 @@ class SshLink(PiLink):
             share = ["-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/cm-%C",
                      "-o", "ControlPersist=900"]
         self.ssh = ["ssh", *share, "-o", "ServerAliveInterval=10", *ssh_opts, target]
-        self.args = self.agent_args(logs, log_cmds, proc, interval)
+        self.args = self.agent_args(logs, log_cmds, proc, interval, log_dirs)
         self.proc: subprocess.Popen | None = None
         self._ping_sent: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -341,6 +347,8 @@ class HttpLink(PiLink):
         self.port = port
         self.server: ThreadingHTTPServer | None = None
         self.last_seen = 0.0
+        self.finishing = False       # answer {"stop": true} so the Pi agent exits by itself
+        self.stop_acked = threading.Event()
 
     def start(self) -> None:
         link = self
@@ -348,6 +356,16 @@ class HttpLink(PiLink):
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):  # keep the console clean
                 pass
+
+            def _reply(self, out: bytes):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def do_GET(self):                    # `curl http://LAPTOP:PORT/ping` from the Pi to test
+                self._reply(b"ok, the laptop is reachable\n")
 
             def do_POST(self):
                 now = time.time()
@@ -364,13 +382,20 @@ class HttpLink(PiLink):
                         if isinstance(m, dict):
                             link.handle(m, now)
                     out = b"{}"
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(out)))
-                self.end_headers()
-                self.wfile.write(out)
+                if link.finishing:
+                    out = b'{"stop": true}'
+                    link.stop_acked.set()
+                self._reply(out)
 
-        self.server = ThreadingHTTPServer(("0.0.0.0", self.port), H)
+        for port in range(self.port, self.port + 20):      # next free port if busy
+            try:
+                self.server = ThreadingHTTPServer(("0.0.0.0", port), H)
+                self.port = self.server.server_address[1]
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError(f"no free port from {self.port}")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def alive(self) -> bool:
@@ -378,6 +403,8 @@ class HttpLink(PiLink):
 
     def stop(self) -> None:
         if self.server:
+            self.finishing = True
+            self.stop_acked.wait(5)          # let the agent hear "stop" before the server goes away
             self.server.shutdown()
 
 
@@ -448,4 +475,11 @@ def laptop_ips() -> list[str]:
             ips.add(info[4][0])
     except OSError:
         pass
-    return sorted(ip for ip in ips if not ip.startswith("127."))
+    # every interface (Wi-Fi, hotspot, Tailscale, USB ethernet ...)
+    cmd = ["ipconfig"] if platform.system() == "Windows" else ["ifconfig"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        ips.update(re.findall(r"(?:inet |IPv4[^:]*:\s*)(\d+\.\d+\.\d+\.\d+)", out))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.", "0.")))

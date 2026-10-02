@@ -282,6 +282,8 @@ def render_markdown(m: dict) -> str:
     out += [f"Wake word: **{meta.get('wake_word')}** - trials: {m['pipeline']['trials']} with the wake word + "
             f"{m['false_wake']['n']} without - shuffle seed: {meta.get('seed')} - "
             f"connection: {meta.get('mode')} - holdout: {meta.get('holdout')}", ""]
+    if meta.get("pi_log_file"):
+        out += [f"Pi log file: {meta['pi_log_file']}", ""]
     mc = meta.get("mic_check")
     if mc:
         out += [f"Mic check (Pi input {meta.get('pi_mic')}): signal-to-noise {mc['snr_db']} dB, laptop speech "
