@@ -136,14 +136,19 @@ def normalize_prediction(intent: str | None, slot: str | None,
     return f"OTHER:{k}", slot, False
 
 
-def resolve_prediction(intent: str | None, slot: str | None, variation, aliases: dict[str, str]
-                       ) -> tuple[str, str, bool, str]:
+def resolve_prediction(intent: str | None, slot: str | None, variation, aliases: dict[str, str],
+                       id_order: list[str] | None = None) -> tuple[str, str, bool, str]:
     """Like normalize_prediction, but also accepts a 93-class output.
 
     `variation` (or an `intent` that is itself one of the 93 phrases) is turned
     into its intent + slot value. Returns (intent, slot, known, variation phrase
     or "").
     """
+    if id_order is not None and str(variation).strip().lstrip("-").isdigit():
+        hit = lookup_id(int(str(variation).strip()), id_order)
+        if hit is None:
+            return f"OTHER:ID_{str(variation).strip()}", "", False, ""
+        return hit[0], hit[1], True, hit[2]
     v = match_variation(variation) if variation not in (None, "") else None
     if v is None and intent and " " in str(intent).strip():
         v = match_variation(intent)
@@ -154,6 +159,61 @@ def resolve_prediction(intent: str | None, slot: str | None, variation, aliases:
         intent = str(variation)
     i, s, known = normalize_prediction(intent, slot, aliases)
     return i, s, known, ""
+
+
+# ---------------------------------------------------------------- numeric class ids
+#
+# A model that prints a number (variation_id) numbers its 93 classes in some order.
+# The orders below are all built from the holdout manifest's `variation` column, so
+# they match how a student most likely built their label list from the dataset.
+
+ID_ORDER_HELP = {
+    "manifest": "order of first appearance in the dataset manifest (= vcmbench/variations.csv); "
+                "out of scope = 93",
+    "alphabetical": "the 93 names sorted A-Z (sorted(set(...)), sklearn LabelEncoder, pandas category); "
+                    "out of scope = 93",
+    "alphabetical_oos": "the 93 names plus OUT_OF_SCOPE, all sorted A-Z together",
+    "file": "your own label file: one name per line (or a JSON list), line 1 = id 0",
+}
+
+
+def manifest_order(variation_column) -> list[str]:
+    """The 93 variation names in order of first appearance in a manifest column."""
+    return list(dict.fromkeys(str(v) for v in variation_column if v and str(v) != "nan"))
+
+
+def read_label_file(path: str | Path) -> list[str]:
+    import json as _json
+    text = Path(path).expanduser().read_text(encoding="utf-8")
+    if str(path).endswith(".json"):
+        obj = _json.loads(text)
+        if isinstance(obj, dict):                       # {"0": "Play music", ...} or {"Play music": 0, ...}
+            if all(str(k).isdigit() for k in obj):
+                return [obj[k] for k in sorted(obj, key=int)]
+            return [k for k, _ in sorted(obj.items(), key=lambda kv: int(kv[1]))]
+        return [str(x) for x in obj]
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def id_orders(manifest_phrases: list[str] | None = None, label_file: str | None = None) -> dict[str, list[str]]:
+    base = list(manifest_phrases or [v.phrase for v in VARIATIONS])
+    out = {"manifest": base + [OOS], "alphabetical": sorted(base) + [OOS],
+           "alphabetical_oos": sorted(base + [OOS])}
+    if label_file:
+        out["file"] = read_label_file(label_file)
+    return out
+
+
+def lookup_id(i: int, order: list[str]) -> tuple[str, str, str] | None:
+    """(intent, slot, variation phrase) for class id `i` in `order`; OOS -> (OOS, "", "");
+    None if the id is outside the list or the name is not one of the 93."""
+    if not 0 <= i < len(order):
+        return None
+    name = order[i]
+    if _key(name) in ("OUT_OF_SCOPE", "OOS", "UNKNOWN", "NONE"):
+        return OOS, "", ""
+    v = match_variation(name)
+    return (v.intent, v.value, v.phrase) if v else None
 
 
 def variations_for(intent: str, value: str = "") -> list[Variation]:

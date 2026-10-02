@@ -48,6 +48,7 @@ for _stream in (sys.stdout, sys.stderr):        # Pi log lines may hold characte
     except (AttributeError, ValueError):
         pass
 
+ID_ORDER: list[str] | None = None   # class-number order for models that print a number (see schema.ID_ORDER_HELP)
 SAVED_SETTINGS = ROOT / "bench_settings.json"     # remembered answers (git-ignored)
 CACHE = ROOT / ".cache"
 
@@ -278,6 +279,7 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
             ("2", f"quick: 1 clip per variation + all out-of-scope ({93 + oos} clips, ~{est(93 + oos):.0f} min)"),
         ], "1"))
     cfg["size"] = size
+    cfg["id_manifest_order"] = S.manifest_order(c.variation for c in all_clips)
     seed = choose_seed(args, cfg)
     rng = random.Random(seed)
     if size == "quick":
@@ -428,14 +430,17 @@ def collect(t: dict, link, aliases: dict, wait_until: float, events_pool: list) 
     t["wake_logged"] = any(e.kind == "wake" for e in evs)
     if cmds:
         e = cmds[0]
-        intent, slot, known, variation = S.resolve_prediction(e.intent, e.slot, getattr(e, "variation", ""),
-                                                              aliases)
+        raw_var = str(getattr(e, "variation", "") or "").strip()
+        intent, slot, known, variation = S.resolve_prediction(e.intent, e.slot, raw_var, aliases,
+                                                              ID_ORDER or S.id_orders()["manifest"])
         t.update(pred_intent=intent, pred_slot=slot, pred_variation=variation,
+                 pred_variation_id=int(raw_var) if raw_var.lstrip("-").isdigit() else None,
                  pred_raw=e.raw or f"{e.intent} {e.slot}".strip(),
                  infer_ms=e.infer_ms, audio_ms=e.audio_ms,
                  latency_s=(e.t - t["cmd_end_abs"]) if not link.manual else None)
     else:
-        t.update(pred_intent=S.NONE, pred_slot="", pred_variation="", pred_raw="", infer_ms=None, audio_ms=None,
+        t.update(pred_intent=S.NONE, pred_slot="", pred_variation="", pred_variation_id=None, pred_raw="",
+                 infer_ms=None, audio_ms=None,
                  latency_s=None)
 
 
@@ -445,6 +450,37 @@ class S_Event:  # tiny stand-in for manual answers
     def __init__(self, intent, slot):
         self.intent, self.slot, self.raw, self.t = intent, slot, f"(typed) {intent} {slot}".strip(), 0.0
         self.infer_ms = self.audio_ms = None
+
+
+def current_id_orders(cfg: dict) -> dict[str, list[str]]:
+    return S.id_orders(cfg.get("id_manifest_order"), cfg.get("id_labels"))
+
+
+def set_id_order(cfg: dict) -> None:
+    global ID_ORDER
+    orders = current_id_orders(cfg)
+    ID_ORDER = orders.get(cfg.get("id_order") or "manifest", orders["manifest"])
+
+
+def choose_id_order(cfg: dict) -> None:
+    info("How does your model number its 93 classes? (all built from the dataset manifest)")
+    keys = list(S.ID_ORDER_HELP)
+    for i, k in enumerate(keys, 1):
+        info(f"  [{i}] {k:17s} {S.ID_ORDER_HELP[k]}")
+    a = ask("Number", str(keys.index(cfg.get("id_order", "manifest")) + 1))
+    k = keys[int(a) - 1] if a.isdigit() and 1 <= int(a) <= len(keys) else "manifest"
+    if k == "file":
+        path = ask("Path to your label file (one class name per line, or JSON list)", cfg.get("id_labels") or "")
+        try:
+            labels = S.read_label_file(path)
+            bad = [x for x in labels if S.lookup_id(0, [x]) is None]
+            info(f"  Read {len(labels)} names" + (f"; not one of the 93 / out of scope: {bad[:5]}" if bad else "."))
+            cfg["id_labels"] = path
+        except OSError as e:
+            info(f"  Could not read it ({e}); keeping '{cfg.get('id_order', 'manifest')}'.")
+            return
+    cfg["id_order"] = k
+    set_id_order(cfg)
 
 
 def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict], aliases: dict) -> None:
@@ -473,6 +509,20 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
             got = f"{t['pred_intent']} {t['pred_slot']}".strip()
             if t.get("pred_variation"):
                 got += f"  (93-class: '{t['pred_variation']}')"
+            if t.get("pred_variation_id") is not None:
+                i = t["pred_variation_id"]
+                orders = current_id_orders(cfg)
+                fit = [n for n, o in orders.items()
+                       if (S.lookup_id(i, o) or ("", "", ""))[2] == t["true_variation"]]
+                info(f"  Your Pi printed class number {i}; read in '{cfg.get('id_order', 'manifest')}' order "
+                     f"that is '{t['pred_variation'] or t['pred_intent']}'.")
+                if t["pred_variation"] != t["true_variation"]:
+                    if fit:
+                        info(f"  !! The spoken command was '{t['true_variation']}', which is number {i} in "
+                             f"'{fit[0]}' order. Your model probably numbers its classes that way: choose 'n'.")
+                    else:
+                        info(f"  !! The spoken command was '{t['true_variation']}'. If your model was right, "
+                             "its class order differs: choose 'n' and give your label file.")
             info(f"  -> understood as: {got}" + ("  (OK)" if t["pred_intent"] == t["true_intent"] else ""))
             if t["n_command_events"] and not link.manual:
                 missing = [k for k in ("infer_ms", "audio_ms") if t.get(k) is None]
@@ -491,6 +541,8 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
                 info(f"  '{t['pred_intent'][6:]}' is not one of the 19 intents. Add an alias, e.g. in "
                      f"bench_settings.json: \"aliases\": {{\"{t['pred_intent'][6:]}\": \"TIMER\"}}")
         options = [("c", "continue to the test")] if timing_ok else []
+        if any(t.get("pred_variation_id") is not None for t in warm):
+            options.append(("n", "set how my model numbers its 93 classes"))
         options += [("r", "replay (after changing the volume / position / your Pi's output)"),
                     ("x", "my Pi printed a line but it was not understood: enter a regex"),
                     ("q", "quit")]
@@ -500,6 +552,9 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
         if a in ("c", "i"):
             cfg["timing_waived"] = a == "i"
             return
+        if a == "n":
+            choose_id_order(cfg)
+            continue
         if a == "q":
             raise SystemExit(0)
         if a == "x":
@@ -793,6 +848,10 @@ def main() -> None:
     ap.add_argument("--gap-min", type=float, default=10.0, help="min seconds between commands")
     ap.add_argument("--gap-max", type=float, default=15.0, help="max seconds between commands")
     ap.add_argument("--model", help="ONNX model for FLOP/parameter counts (laptop path or pi:PATH)")
+    ap.add_argument("--id-order", choices=list(S.ID_ORDER_HELP),
+                    help="how your model numbers its 93 classes, if it prints a number (default manifest)")
+    ap.add_argument("--id-labels", help="your label file for --id-order file (one class name per line)")
+    ap.add_argument("--rescore", metavar="RUN_DIR", help="score a finished run again (e.g. with another --id-order)")
     ap.add_argument("--seed", type=int, help="shuffle seed (order + false-wake clips); asked if not given")
     ap.add_argument("--runs-dir", default=str(ROOT / "runs"))
     ap.add_argument("--resume", help="resume / re-score an earlier run folder")
@@ -810,6 +869,9 @@ def main() -> None:
           "listens, and this script scores what your assistant did. Answer the questions;\n"
           "press Enter to accept the [default].")
 
+    if args.rescore:
+        rescore(args)
+        return
     if args.resume:
         run_dir = Path(args.resume)
         cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
@@ -829,6 +891,11 @@ def main() -> None:
         trials = None
     cfg["student"] = args.student or cfg.get("student") or ask("Your name or student number", "")
 
+    if args.id_order:
+        cfg["id_order"] = args.id_order
+    if args.id_labels:
+        cfg["id_labels"] = args.id_labels
+    set_id_order(cfg)
     link = setup_pi(args, cfg, run_dir)
     aliases = S.build_alias_table(cfg.get("aliases"))
     try:
@@ -849,6 +916,7 @@ def main() -> None:
             t_start, t_end = run_trials(args, cfg, link, player, run_dir, trials, aliases)
     finally:
         link.stop()
+    cfg["t_end"] = t_end
     save_cfg(cfg, run_dir)
 
     banner(6, "Results")
@@ -858,6 +926,8 @@ def main() -> None:
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
     meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
                                      "seed")}
+    meta["id_order"] = cfg.get("id_order")
+    meta["id_orders"] = current_id_orders(cfg)
     meta["holdout"] = cfg.get("holdout") or "huggingface"
     meta["gap_s"] = [args.gap_min, args.gap_max]
     m = score(done, samples, link.specs, prof, t_start, t_end, meta)
@@ -868,6 +938,34 @@ def main() -> None:
     cleanup(run_dir, bool(cfg.get("delete_audio")))
     acc = m["intent_level"]["accuracy"]
     notify("VCM benchmark finished", f"{len(done)} commands, intent accuracy {100 * acc:.1f}%")
+
+
+def rescore(args) -> None:
+    """Score a finished run again from its saved files (no Pi, no audio)."""
+    run_dir = Path(args.rescore)
+    cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    if args.id_order:
+        cfg["id_order"] = args.id_order
+    if args.id_labels:
+        cfg["id_labels"] = args.id_labels
+    done = [json.loads(l) for l in (run_dir / "trials.jsonl").read_text(encoding="utf-8").splitlines() if l]
+    sp = run_dir / "pi_samples.jsonl"
+    samples = [json.loads(l) for l in sp.read_text(encoding="utf-8").splitlines() if l] if sp.exists() else []
+    specs_p = run_dir / "pi_specs.json"
+    specs = json.loads(specs_p.read_text(encoding="utf-8")) if specs_p.exists() else {}
+    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
+                                     "seed", "pi_mic", "mic_check", "id_order")}
+    meta["id_orders"] = current_id_orders(cfg)
+    meta["holdout"] = cfg.get("holdout") or "huggingface"
+    t_start = cfg.get("t_start") or min((t.get("play_t0") or 0) for t in done)
+    t_end = cfg.get("t_end") or max((t.get("play_t0") or 0) for t in done) + 15
+    old = run_dir / "metrics.json"
+    prof = json.loads(old.read_text(encoding="utf-8")).get("model") if old.exists() else None
+    m = score(done, samples, specs, prof, t_start, t_end, meta)
+    report = write_outputs(run_dir, m, done, samples)
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    print(report.read_text(encoding="utf-8"))
+    info(f"Re-scored with class-number order '{cfg.get('id_order', 'manifest')}'. Saved in {run_dir}")
 
 
 def save_cfg(cfg: dict, run_dir: Path) -> None:

@@ -365,3 +365,55 @@ def test_score_exact_wording():
     assert m["exact_wording"]["accuracy"] == pytest.approx(1 / 3)          # wording must match too
     assert ("Pause", "Stop") in [c for c, _ in m["command_level"]["confusions"]]
     assert "93-class output" in render_markdown(m)
+
+
+# ---------------------------------------------------------------- class-number order
+
+def test_id_orders_from_manifest(tmp_path):
+    orders = S.id_orders()
+    assert len(orders["manifest"]) == 94 and orders["manifest"][93] == S.OOS
+    assert S.lookup_id(0, orders["manifest"])[2] == "Play music"
+    assert S.lookup_id(0, orders["alphabetical"])[2] == "Adjust brightness to 100 percent"
+    assert S.lookup_id(93, orders["alphabetical"])[0] == S.OOS
+    assert S.lookup_id(94, orders["manifest"]) is None
+    f = tmp_path / "labels.txt"
+    f.write_text("OUT_OF_SCOPE\nTime\nPlay music\n", encoding="utf-8")
+    o = S.id_orders(label_file=str(f))["file"]
+    assert S.lookup_id(0, o)[0] == S.OOS and S.lookup_id(2, o)[2] == "Play music"
+    j = tmp_path / "labels.json"
+    j.write_text('{"Time": 1, "Play music": 0}', encoding="utf-8")
+    assert S.read_label_file(j) == ["Play music", "Time"]
+
+
+def test_wrong_id_order_is_detected_and_rescored(tmp_path):
+    alpha = S.id_orders()["alphabetical"]
+    phrases = ["Time", "Weather", "Lights on", "Pause"]
+    trials = []
+    for p in phrases:                                  # the model numbers its classes alphabetically
+        v = S.match_variation(p)
+        t = _trial(v.intent, v.phrase, v.value, "", "")
+        t.update(pred_variation_id=alpha.index(v.phrase), n_command_events=1, transcript=p)
+        trials.append(t)
+    m = score([dict(t) for t in trials], [], {}, None, 0, 10, {"id_order": "manifest"})
+    ic = m["id_order_check"]
+    assert ic["better"] == "alphabetical" and ic["matches"]["alphabetical"] == 4
+    assert "--id-order alphabetical" in render_markdown(m)
+    m2 = score([dict(t) for t in trials], [], {}, None, 0, 10, {"id_order": "alphabetical"})
+    assert m2["command_level"]["accuracy"] == 1.0 and m2["id_order_check"]["better"] is None
+
+
+def test_rescore_cli(tmp_path):
+    import json as _json
+    alpha = S.id_orders()["alphabetical"]
+    v = S.match_variation("Time")
+    t = _trial(v.intent, v.phrase, "", S.NONE, "")
+    t.update(pred_variation_id=alpha.index("Time"), n_command_events=1, transcript="Time", play_t0=1.0)
+    (tmp_path / "trials.jsonl").write_text(_json.dumps(t) + "\n", encoding="utf-8")
+    (tmp_path / "config.json").write_text(_json.dumps({"id_order": "manifest", "mode": "sim"}), encoding="utf-8")
+    r = subprocess.run([sys.executable, str(ROOT / "benchmark.py"), "--rescore", str(tmp_path),
+                        "--id-order", "alphabetical"], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=120)
+    assert r.returncode == 0, r.stderr[-1500:]
+    m = _json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
+    assert m["intent_level"]["accuracy"] == 1.0
+    assert _json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["id_order"] == "alphabetical"

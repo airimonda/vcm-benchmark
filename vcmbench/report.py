@@ -7,12 +7,44 @@ import math
 from pathlib import Path
 
 from . import metrics as M
+from . import schema as S
 from .schema import NONE, OOS, SLOTTED
 from .slots import slot_distance
 
 
 def _voice(t: dict) -> str:
     return "synthetic voice" if t.get("is_synthetic") else "real voice"
+
+
+def apply_id_order(trials: list[dict], meta: dict) -> dict | None:
+    """For models that print a class number: map every number with the chosen order
+    (meta["id_order"]) and check how well each known order fits the right answers."""
+    with_id = [t for t in trials if t.get("pred_variation_id") is not None]
+    if not with_id:
+        return None
+    orders = meta.get("id_orders") or S.id_orders()
+    chosen = meta.get("id_order") or "manifest"
+    if chosen not in orders:
+        chosen = "manifest"
+    for t in with_id:
+        hit = S.lookup_id(int(t["pred_variation_id"]), orders[chosen])
+        if hit is None:
+            t.update(pred_intent=f"OTHER:ID_{t['pred_variation_id']}", pred_slot="", pred_variation="")
+        else:
+            t.update(pred_intent=hit[0], pred_slot=hit[1], pred_variation=hit[2])
+    scored = [t for t in with_id if t.get("kind", "wake") == "wake"]
+
+    def fits(order):
+        n = 0
+        for t in scored:
+            hit = S.lookup_id(int(t["pred_variation_id"]), order)
+            if hit and (hit[2] == t["true_variation"] or (hit[0] == OOS and t["true_intent"] == OOS)):
+                n += 1
+        return n
+    fit = {name: fits(order) for name, order in orders.items()}
+    best = max(fit, key=fit.get)
+    return {"chosen": chosen, "n": len(scored), "matches": fit,
+            "better": best if fit[best] > fit[chosen] else None}
 
 
 def group_metrics(sub: list[dict], no_wake: list[dict]) -> dict:
@@ -51,6 +83,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         "wake_word_logged": sum(bool(t.get("wake_logged")) for t in no_wake),
         "fired": sorted(f"{t.get('transcript', '?')} -> {t['pred_intent']}" for t in no_wake if t["false_wake"]),
     }
+    id_check = apply_id_order(trials + no_wake, meta)
     yt_i, yp_i, yt_c, yp_c, slot_rows = [], [], [], [], []
     for t in trials:
         truth_oos = t["true_intent"] == OOS
@@ -102,6 +135,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         "intent_level": M.classification_report(yt_i, yp_i),
         "command_level": M.classification_report(yt_c, yp_c),
         "exact_wording": exact,
+        "id_order_check": id_check,
         "false_wake": false_wake,
         "slots": M.slot_report(slot_rows),
         "breakdowns": breakdowns,
@@ -228,6 +262,13 @@ def render_glance(m: dict) -> list[str]:
     if p["trials"] and p["response_rate"] < 0.9:
         warn.append(f"the Pi answered only {_fmt(p['response_rate'], True)} of commands: check volume, "
                     "distance, wake word and the log path")
+    ic = m.get("id_order_check")
+    if ic and ic.get("better"):
+        b = ic["better"]
+        warn.append(f"your Pi printed class numbers, read in '{ic['chosen']}' order: only "
+                    f"{ic['matches'][ic['chosen']]}/{ic['n']} matched. In '{b}' order "
+                    f"{ic['matches'][b]}/{ic['n']} match, so your model probably numbers its classes that "
+                    f"way. Re-score: python benchmark.py --rescore <this run folder> --id-order {b}")
     if p.get("extra_fires"):
         warn.append(f"{p['extra_fires']} extra fire(s): more than one command for one utterance")
     if warn:
@@ -352,7 +393,7 @@ def render_markdown(m: dict) -> str:
 
 
 TRIAL_COLUMNS = ["order", "kind", "false_wake", "clip_idx", "accent_group", "transcript", "true_intent", "true_variation", "true_slot",
-                 "pred_intent", "pred_slot", "pred_variation", "pred_raw", "correct_intent", "correct_command",
+                 "pred_intent", "pred_slot", "pred_variation", "pred_variation_id", "pred_raw", "correct_intent", "correct_command",
                  "slot_exact", "slot_abs_error", "slot_phonetic_dist", "n_command_events", "wake_logged",
                  "latency_s", "infer_ms", "audio_ms", "speaker_id", "is_synthetic", "wake_take", "audio_file"]
 
