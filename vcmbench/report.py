@@ -11,6 +11,32 @@ from .schema import NONE, OOS, SLOTTED
 from .slots import slot_distance
 
 
+def _voice(t: dict) -> str:
+    return "synthetic voice" if t.get("is_synthetic") else "real voice"
+
+
+def group_metrics(sub: list[dict], no_wake: list[dict]) -> dict:
+    """All headline metrics for one group of (already scored) trials."""
+    out = {"n": len(sub), "n_no_wake": len(no_wake)}
+    if sub:
+        I = M.classification_report([t["y_intent"][0] for t in sub], [t["y_intent"][1] for t in sub])
+        C = M.classification_report([t["y_command"][0] for t in sub], [t["y_command"][1] for t in sub])
+        slots = [t["slot_exact"] for t in sub if "slot_exact" in t]
+        lat = M.summarize([t.get("latency_s") for t in sub])
+        out.update({k: I[k] for k in ("accuracy", "accuracy_ci95", "balanced_accuracy", "macro_f1", "macro_f2",
+                                      "false_accept_rate", "false_accepts", "n_out_of_scope",
+                                      "false_reject_rate", "misfire_rate")})
+        out.update(command_accuracy=C["accuracy"], command_balanced_accuracy=C["balanced_accuracy"],
+                   command_macro_f1=C["macro_f1"], command_macro_f2=C["macro_f2"],
+                   command_false_reject_rate=C["false_reject_rate"], command_misfire_rate=C["misfire_rate"],
+                   slot_exact_rate=sum(slots) / len(slots) if slots else None, n_slot=len(slots),
+                   latency_p50=lat.get("p50"), latency_p95=lat.get("p95"))
+    if no_wake:
+        fw = sum(t["false_wake"] for t in no_wake)
+        out.update(false_wakes=fw, false_wake_rate=fw / len(no_wake))
+    return out
+
+
 def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: dict | None,
           t_start: float, t_end: float, meta: dict) -> dict:
     no_wake = [t for t in trials if t.get("kind") == "no_wake"]
@@ -43,17 +69,15 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         intent_ok = pred == t["true_intent"]
         yp_c.append(M.command_label(pred, t.get("pred_slot") or "",
                                     t["true_variation"] if intent_ok else None, slot_ok and intent_ok))
+        t["y_intent"] = (yt_i[-1], yp_i[-1])
+        t["y_command"] = (yt_c[-1], yp_c[-1])
         t["correct_intent"] = yt_i[-1] == yp_i[-1]
         t["correct_command"] = yt_c[-1] == yp_c[-1]
 
-    by_voice = {}
-    for name, keep in (("real voice", lambda t: not t.get("is_synthetic")),
-                       ("synthetic voice", lambda t: t.get("is_synthetic"))):
-        sub = [t for t in trials if keep(t)]
-        if sub:
-            by_voice[name] = {"n": len(sub),
-                              "intent_accuracy": sum(t["correct_intent"] for t in sub) / len(sub),
-                              "command_accuracy": sum(t["correct_command"] for t in sub) / len(sub)}
+    # overall, then real vs synthetic voices; each group scored on its own
+    breakdowns = {"overall": group_metrics(trials, no_wake)}
+    for g in ("real voice", "synthetic voice"):
+        breakdowns[g] = group_metrics([t for t in trials if _voice(t) == g], [t for t in no_wake if _voice(t) == g])
 
     any_wake_log = any(t.get("wake_logged") for t in trials)
     responded = [t for t in trials if t["n_command_events"] > 0]
@@ -69,7 +93,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         "command_level": M.classification_report(yt_c, yp_c),
         "false_wake": false_wake,
         "slots": M.slot_report(slot_rows),
-        "by_voice": by_voice,
+        "breakdowns": breakdowns,
         "pipeline": {
             "trials": len(trials),
             "response_rate": len(responded) / len(trials) if trials else float("nan"),
@@ -107,6 +131,99 @@ def _table(rows: list[list[str]]) -> list[str]:
     return [line(rows[0]), "|" + "|".join("-" * (x + 2) for x in w) + "|"] + [line(r) for r in rows[1:]]
 
 
+def render_breakdowns(bd: dict) -> list[str]:
+    """Overall vs real vs synthetic voices, every metric per group, at both label levels."""
+    if not bd:
+        return []
+    groups = [(g, v) for g, v in bd.items() if v["n"] or v["n_no_wake"]]
+    out = ["## Overall vs real vs synthetic voices", "",
+           "Each group is scored on its own. '-' = the group has no clips of that kind. The holdout's 10 "
+           "out-of-scope clips are all real recordings (none are synthetic), so there is no false accept "
+           "rate for synthetic voices.", ""]
+    rate = lambda v, key, k, n: f"{_fmt(v.get(key), True)} ({v.get(k)}/{v.get(n)})" if v.get(n) else "-"
+    lines = [
+        ("clips (with wake word)", lambda v: v["n"]),
+        ("**19 intents** accuracy", lambda v: f"{_fmt(v.get('accuracy'), True)} {_ci(v.get('accuracy_ci95'))}"),
+        ("balanced accuracy", lambda v: _fmt(v.get("balanced_accuracy"), True)),
+        ("F1 (macro)", lambda v: _fmt(v.get("macro_f1"), True)),
+        ("F2 (macro)", lambda v: _fmt(v.get("macro_f2"), True)),
+        ("false accept rate", lambda v: rate(v, "false_accept_rate", "false_accepts", "n_out_of_scope")),
+        ("false reject rate", lambda v: _fmt(v.get("false_reject_rate"), True)),
+        ("misfire rate", lambda v: _fmt(v.get("misfire_rate"), True)),
+        ("**93 commands** accuracy", lambda v: _fmt(v.get("command_accuracy"), True)),
+        ("balanced accuracy", lambda v: _fmt(v.get("command_balanced_accuracy"), True)),
+        ("F1 (macro)", lambda v: _fmt(v.get("command_macro_f1"), True)),
+        ("F2 (macro)", lambda v: _fmt(v.get("command_macro_f2"), True)),
+        ("misfire rate", lambda v: _fmt(v.get("command_misfire_rate"), True)),
+        ("slot exact (intent right)", lambda v: f"{_fmt(v.get('slot_exact_rate'), True)} (n={v.get('n_slot')})"
+                                                if v.get("n_slot") else "-"),
+        ("latency p50 / p95", lambda v: f"{_fmt(v.get('latency_p50'), nd=2)} / {_fmt(v.get('latency_p95'), nd=2)} s"
+                                        if v.get("latency_p50") is not None else "-"),
+        ("false wake rate (no wake word)", lambda v: rate(v, "false_wake_rate", "false_wakes", "n_no_wake")),
+    ]
+    rows = [["metric"] + [g for g, _ in groups]]
+    for label, f in lines:
+        rows.append([label] + [f(v) if v["n"] or label.startswith("false wake") else "-" for _, v in groups])
+    return out + _table(rows) + [""]
+
+
+def render_glance(m: dict) -> list[str]:
+    """Top-of-report summary: the handful of numbers to look at first, plus warnings."""
+    bd = m.get("breakdowns") or {}
+    groups = [(g, v) for g, v in bd.items() if v["n"] or v["n_no_wake"]]
+    out = ["## At a glance", ""]
+    if groups:
+        cnt = lambda v, key, k, n: f"{_fmt(v.get(key), True)} ({v.get(k)}/{v.get(n)})" if v.get(n) else "-"
+        lines = [
+            ("intent accuracy (19)", lambda v: _fmt(v.get("accuracy"), True)),
+            ("command accuracy (93)", lambda v: _fmt(v.get("command_accuracy"), True)),
+            ("false accept (out of scope fired)", lambda v: cnt(v, "false_accept_rate", "false_accepts", "n_out_of_scope")),
+            ("false reject (command ignored)", lambda v: _fmt(v.get("false_reject_rate"), True)),
+            ("false wake (no wake word, fired)", lambda v: cnt(v, "false_wake_rate", "false_wakes", "n_no_wake")),
+            ("slot exact", lambda v: _fmt(v.get("slot_exact_rate"), True)),
+            ("latency p95", lambda v: f"{_fmt(v.get('latency_p95'), nd=2)} s" if v.get("latency_p95") is not None else "-"),
+        ]
+        rows = [[""] + [g for g, _ in groups]]
+        for label, f in lines:
+            rows.append([label] + [f(v) for _, v in groups])
+        out += _table(rows) + [""]
+
+    pi = m["pi"]
+    g = lambda k, stat: (pi.get(k) or {}).get(stat)
+    parts = []
+    if g("rtf", "n"):
+        parts.append(f"real-time factor {_fmt(g('rtf', 'mean'))} (p95 {_fmt(g('rtf', 'p95'))})")
+    if g("infer_ms", "n"):
+        parts.append(f"inference {_fmt(g('infer_ms', 'mean'), nd=0)} ms")
+    if g("temp_c", "n"):
+        parts.append(f"CPU temp max {_fmt(g('temp_c', 'max'), nd=1)} C")
+    if g("cpu_pct_process", "n"):
+        parts.append(f"runtime CPU {_fmt(g('cpu_pct_process', 'mean'), nd=0)}% mean")
+    if g("rss_mb_process", "n"):
+        parts.append(f"runtime RAM {_fmt(g('rss_mb_process', 'max'), nd=0)} MB peak")
+    if m.get("model") and m["model"].get("flops_si"):
+        parts.append(f"{m['model']['flops_si']} per inference")
+    if parts:
+        out += ["**Pi:** " + ", ".join(parts), ""]
+
+    warn = []
+    p = m["pipeline"]
+    if p["unknown_intent_names"]:
+        warn.append("unknown intent names from the Pi (scored wrong): " + ", ".join(p["unknown_intent_names"]))
+    if p.get("commands_missing_timing"):
+        warn.append(f"{p['commands_missing_timing']} command line(s) without infer_ms/audio_ms")
+    if pi.get("throttled_flags_seen"):
+        warn.append("the Pi throttled (flags " + ", ".join(pi["throttled_flags_seen"]) + "): check power/cooling")
+    if p["trials"] and p["response_rate"] < 0.9:
+        warn.append(f"the Pi answered only {_fmt(p['response_rate'], True)} of commands: check volume, "
+                    "distance, wake word and the log path")
+    if p.get("extra_fires"):
+        warn.append(f"{p['extra_fires']} extra fire(s): more than one command for one utterance")
+    if warn:
+        out += ["**Check:**", ""] + [f"- {w}" for w in warn] + [""]
+    return out
+
+
 def render_markdown(m: dict) -> str:
     out = [f"# VCM benchmark - {m['meta'].get('student') or 'student'} - {m['meta'].get('started')}", ""]
     meta = m["meta"]
@@ -114,7 +231,8 @@ def render_markdown(m: dict) -> str:
             f"{m['false_wake']['n']} without - shuffle seed: {meta.get('seed')} - "
             f"connection: {meta.get('mode')} - holdout: {meta.get('holdout')}", ""]
 
-    out += ["## Classification", ""]
+    out += render_glance(m)
+    out += ["# Detailed metrics", "", "## Classification", ""]
     rows = [["metric", "19 intents (+reject)", "93 commands (+reject)"]]
     I, C = m["intent_level"], m["command_level"]
     for key, label, pct in [("accuracy", "accuracy", True), ("balanced_accuracy", "balanced accuracy", True),
@@ -145,10 +263,7 @@ def render_markdown(m: dict) -> str:
     if p["unknown_intent_names"]:
         out += [f"**Unknown intent names from the Pi (scored wrong; add aliases):** "
                 f"{', '.join(p['unknown_intent_names'])}", ""]
-    if m["by_voice"]:
-        out += _table([["voice", "n", "intent acc", "command acc"]] +
-                      [[k, v["n"], _fmt(v["intent_accuracy"], True), _fmt(v["command_accuracy"], True)]
-                       for k, v in m["by_voice"].items()]) + [""]
+    out += render_breakdowns(m.get("breakdowns") or {})
 
     out += ["## Slot values (slotted intents, intent right)", "",
             "abs error = Manhattan (L1) distance in the slot's unit (alarm: minutes, circular over 24 h); "
@@ -218,7 +333,7 @@ def render_markdown(m: dict) -> str:
     return "\n".join(out)
 
 
-TRIAL_COLUMNS = ["order", "kind", "false_wake", "clip_idx", "transcript", "true_intent", "true_variation", "true_slot",
+TRIAL_COLUMNS = ["order", "kind", "false_wake", "clip_idx", "accent_group", "transcript", "true_intent", "true_variation", "true_slot",
                  "pred_intent", "pred_slot", "pred_raw", "correct_intent", "correct_command",
                  "slot_exact", "slot_abs_error", "slot_phonetic_dist", "n_command_events", "wake_logged",
                  "latency_s", "infer_ms", "audio_ms", "speaker_id", "is_synthetic", "wake_take", "audio_file"]

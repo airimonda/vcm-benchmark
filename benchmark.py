@@ -325,7 +325,7 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
         A.save(path, x)
         trials.append({"order": k, "kind": kind, "clip_idx": c.idx, "transcript": c.transcript,
                        "true_intent": c.intent, "true_variation": c.variation, "true_slot": c.slot_value,
-                       "speaker_id": c.speaker_id, "is_synthetic": c.is_synthetic,
+                       "speaker_id": c.speaker_id, "is_synthetic": c.is_synthetic, "accent_group": c.accent_group,
                        "wake_take": wi + 1, "audio_file": path.relative_to(run_dir).as_posix(), **off})
     (run_dir / "plan.json").write_text(json.dumps(trials, indent=2), encoding="utf-8")
     nw = sum(t["kind"] == "no_wake" for t in trials)
