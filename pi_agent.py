@@ -15,6 +15,8 @@ mode and it will push everything to the laptop over HTTP:
 Options:
     --specs-only      print one "specs" JSON line and exit
     --log PATH        tail this file (repeatable); only NEW lines are reported
+    --auto-logs       also follow any log-like file under ~ (.log .jsonl .txt .out;
+                      no hidden/venv/data folders) that grows, plus the user journal
     --log-dir DIR     follow the newest *.log file directly inside DIR (repeatable;
                       DIR may not exist yet). On start the newest file is read
                       from its end; each newer file (a new run of your assistant)
@@ -567,6 +569,103 @@ def dir_loop(dirpath):
         emit_error("log-dir:" + dirpath, e)
 
 
+# ---------------------------------------------------------------- automatic log discovery
+AUTO_EXT = (".log", ".jsonl", ".txt", ".out")
+AUTO_SKIP = set(["node_modules", "site-packages", "__pycache__", "venv", "env", "dist", "build",
+                 "clips", "data", "datasets", "models", "audio", "wav"])
+
+
+def _auto_candidates(root, depth=4):
+    """Log-like files under the home folder (no hidden, venv, cache or data folders)."""
+    out = []
+    stack = [(root, 0)]
+    while stack:
+        d, lvl = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            name = e.name
+            if name.startswith(".") and name != ".vcm_benchmark":
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if lvl < depth and name.lower() not in AUTO_SKIP and not name.startswith(".venv"):
+                        stack.append((e.path, lvl + 1))
+                elif e.is_file(follow_symlinks=False) and name.lower().endswith(AUTO_EXT):
+                    out.append(e.path)
+            except OSError:
+                continue
+    return out
+
+
+def auto_loop(root, skip_dirs=(), skip_files=()):
+    """Follow every log-like file under `root` that grows after the agent starts (the student's
+    assistant is writing it). Each line is emitted with its file path; the laptop decides which
+    file holds the commands."""
+    root = os.path.expanduser(root)
+    skip = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in skip_dirs)
+    skip_f = set(os.path.realpath(os.path.expanduser(f)) for f in skip_files)
+    sizes = {}          # path -> position already read
+    bufs = {}
+    first = True
+    next_scan = 0.0
+    try:
+        while not STOP.is_set():
+            if time.time() >= next_scan:
+                next_scan = time.time() + 10.0
+                for path in _auto_candidates(root):
+                    rp = os.path.realpath(path)
+                    if (skip and rp.startswith(skip)) or rp in skip_f:
+                        continue                     # already followed by --log-dir / --log
+                    if path not in sizes and len(sizes) < 2000:
+                        try:
+                            # files that exist now: only new text; files created later: from the start
+                            sizes[path] = os.path.getsize(path) if first else 0
+                        except OSError:
+                            continue
+                first = False
+            grew = False
+            for path in list(sizes):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                pos = sizes[path]
+                if size < pos:                       # truncated / rotated
+                    pos = 0
+                if size == pos:
+                    continue
+                try:
+                    with open(path, "rb") as fh:
+                        fh.seek(pos)
+                        data = fh.read(min(size - pos, 1 << 20))
+                except OSError:
+                    continue
+                sizes[path] = pos + len(data)
+                grew = True
+                now = time.time()
+                buf = bufs.get(path, b"") + data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    emit({"type": "log", "path": path, "line": line.decode("utf-8", "replace").rstrip("\r"),
+                          "t": now, "auto": True})
+                bufs[path] = buf[-65536:]
+            STOP.wait(0.05 if grew else 0.25)
+    except Exception as e:
+        emit_error("auto-logs", e)
+
+
+def journal_ok():
+    try:
+        r = subprocess.run(["journalctl", "--user", "-n", "0", "--no-pager"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------- log commands
 _children = []
 _children_lock = threading.Lock()
@@ -739,6 +838,8 @@ def main(argv=None):
     ap.add_argument("--log", action="append", default=[])
     ap.add_argument("--log-dir", action="append", default=[])
     ap.add_argument("--log-cmd", action="append", default=[])
+    ap.add_argument("--auto-logs", action="store_true",
+                    help="also follow any log-like file under ~ that grows, and the user journal")
     ap.add_argument("--proc")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--post")
@@ -781,6 +882,10 @@ def main(argv=None):
         start(dir_loop, d)
     for c in args.log_cmd:
         start(cmd_loop, c)
+    if args.auto_logs:
+        start(auto_loop, "~", tuple(args.log_dir), tuple(args.log))
+        if journal_ok():
+            start(cmd_loop, "journalctl --user -f -n 0 -o cat")
     start(metrics_loop, max(0.05, args.interval), args.proc, tuple(args.log),
           tuple(args.log_dir))
 

@@ -219,3 +219,34 @@ def test_log_dir_missing_at_start(tmp_path):
         assert any(m["type"] == "log_file" and m["path"].endswith("x.log") for m in seen)
     finally:
         _stop(p)
+
+
+def test_auto_logs_follows_growing_files(tmp_path):
+    """--auto-logs: lines appended to any log-like file under ~ arrive (hidden folders skipped)."""
+    home = tmp_path
+    (home / "myassistant" / "logs").mkdir(parents=True)
+    convo = home / "myassistant" / "logs" / "convo.jsonl"
+    convo.write_text('{"old": 1}\n')
+    (home / ".hidden").mkdir()
+    hidden = home / ".hidden" / "x.log"
+    hidden.write_text("")
+    env = dict(os.environ, HOME=str(home))
+    p = subprocess.Popen([sys.executable, AGENT, "--auto-logs", "--interval", "0.5"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        time.sleep(1.5)
+        with open(convo, "a") as f:
+            f.write('{"intent": "TIME"}\n')
+        with open(hidden, "a") as f:
+            f.write("hidden line\n")
+        got, deadline = [], time.time() + 10
+        while time.time() < deadline and not any(m.get("line") == '{"intent": "TIME"}' for m in got):
+            line = p.stdout.readline()
+            if line:
+                got.append(json.loads(line))
+        logs = [m for m in got if m.get("type") == "log"]
+        assert any(m["line"] == '{"intent": "TIME"}' and m["path"] == str(convo) and m.get("auto") for m in logs)
+        assert not any(m["line"] in ('{"old": 1}', "hidden line") for m in logs)
+    finally:
+        p.stdin.close()
+        p.wait(5)

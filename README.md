@@ -57,10 +57,17 @@ On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard li
 ## Before you start
 
 1. **Your Pi is connected** to the laptop's network (same Wi-Fi, hotspot, Tailscale, cable ...).
-2. **Your assistant writes one line per command to a log file in `~/vcm_benchmark/` on the Pi**,
-   named `<id>_<date-time>.log` (a new file each time your assistant starts). The benchmark reads
-   the newest file there. Format: see [What your Pi must print](#what-your-pi-must-print).
-   Minimal version:
+2. **Your assistant logs each command it recognises** to a file on the Pi. The benchmark reads it
+   directly, whatever the format:
+   * the newest `.log` in `~/vcm_benchmark/` (recommended name: `<id>_<date-time>.log`), or
+   * otherwise **any log file your assistant writes** under your home folder (`.log`, `.jsonl`,
+     `.txt`, `.out`) or its systemd journal: the file that shows a command first is used, and
+     the report names it.
+
+   Any format works: JSON (also nested, e.g. `{"heard": {"intent": ..., "slots": {...}}}`),
+   `intent=TIMER slot=30 seconds`, or plain text like `TIMER 30 seconds | model 42 ms`. Required:
+   the intent (or one of the 93 phrases / its class number), and for timing `infer_ms` and
+   `audio_ms` (see [What your Pi must print](#what-your-pi-must-print)). Minimal version:
 
    ```python
    import datetime, json, os
@@ -182,7 +189,12 @@ Your assistant must append **one line per recognised command** to a log file on 
 | `infer_ms` | time your model took for this command: feature extraction + model, in milliseconds | **yes** |
 | `audio_ms` | length of the audio your model processed for this command, in milliseconds | **yes** |
 
-Any of these formats work out of the box:
+The benchmark reads almost any format: JSON (any nesting; also Python `{'intent': ...}` dicts and
+objects spread over several lines), `key=value` / `key: value` text, and plain text that names
+exactly one intent (written as a label: `TIMER`, `set_temperature_22`) or one of the 93 phrases.
+Timing in plain text is picked up from e.g. `took 85 ms` / `model 42ms` and `audio 1500 ms` /
+`window 1.5 s`. If a line is still not understood, the sound check shows it and you can give a
+pattern (`x`). For example, all of these work:
 
 ```
 {"intent": "TIMER", "slot": "30 seconds", "infer_ms": 85, "audio_ms": 1500}
