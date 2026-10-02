@@ -160,8 +160,9 @@ print(json.dumps({"intent": intent, "slot": slot,
 
 ### If your model outputs the 93 classes
 
-Print the phrase it chose, exactly as in [`vcmbench/variations.csv`](vcmbench/variations.csv)
-(case and punctuation don't matter), or its row number there, counting from 0:
+Print the phrase it chose (as in the dataset manifest's `variation` column, or
+[`vcmbench/variations.csv`](vcmbench/variations.csv); case and punctuation don't matter), or its
+class number:
 
 ```
 {"variation": "Set the temperature to 22 degrees", "infer_ms": 85, "audio_ms": 1500}
@@ -174,8 +175,32 @@ The phrase is turned into its intent and slot (here TEMPERATURE, 22 degrees), so
 the same as for intent + slot models. The 93-command scores use **the same rule for everyone**
 (intent and slot right, wording not judged), so all students stay comparable. On top of that, the
 report shows an **exact wording** accuracy for 93-class models: the chosen phrase must be the one
-that was spoken. Use `variation_id` only if your class order is the same as `variations.csv`; if
-not, print the phrase. A phrase that is not one of the 93 is scored wrong and listed in the report.
+that was spoken. A phrase that is not one of the 93 is scored wrong and listed in the report.
+
+**Class numbers.** A number only means something with your model's class order. All orders below
+are built from the holdout manifest's `variation` column; pick yours with `--id-order` (or `n` in
+the sound check):
+
+| `--id-order` | Class 0, 1, 2, ... = | Out of scope |
+|---|---|---|
+| `manifest` (default) | order of first appearance in the manifest (same as `variations.csv`) | 93 |
+| `alphabetical` | names sorted A-Z: `sorted(set(...))`, sklearn `LabelEncoder`, pandas category | 93 |
+| `alphabetical_oos` | the 93 names + `OUT_OF_SCOPE`, sorted A-Z together | where it sorts |
+| `file` | your own label file (`--id-labels labels.txt`: one name per line, line 1 = class 0; or a JSON list / `{"name": id}`) | where `OUT_OF_SCOPE` is in the file |
+
+You are not scored wrong silently:
+
+* in the sound check, the script shows which phrase your number was read as; if that is not the
+  spoken command but another order gives the right one, it says so;
+* after the test, it checks every order against the right answers; if another order fits
+  better, the report's **Check** list says so and gives the command to re-score.
+
+Re-scoring needs no Pi and no audio:
+
+```
+python benchmark.py --rescore runs/<run-id> --id-order alphabetical
+python benchmark.py --rescore runs/<run-id> --id-order file --id-labels my_labels.txt
+```
 
 The real-time factor in the report is `infer_ms / audio_ms`. The sound check refuses to start
 the test until both fields are present (you can override it, and the report then marks timing
