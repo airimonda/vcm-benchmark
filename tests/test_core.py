@@ -525,3 +525,55 @@ def test_pi_push_picks_reachable_address_and_stops(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+# ---------------------------------------------------------------- any log format
+
+@pytest.mark.parametrize("line,intent,slot,infer", [
+    ('{"id": "t1", "heard": {"intent": "TEMPERATURE", "slots": {"temperature": "18 degrees"}}}',
+     "TEMPERATURE", "18 degrees", None),                                   # nested JSON
+    ("  TEMPERATURE  {'temperature': '18'}  ->  accepted=True  say='Setting 18'", "TEMPERATURE", "18", None),
+    ("2026-10-02 12:00:01,123 INFO Heard: set_temperature_22 (p=0.97) took 85 ms", "TEMPERATURE", "22", 85.0),
+    ("\x1b[32m[RESULT]\x1b[0m TIMER 30 seconds | conf 0.88 | model 42ms", "TIMER", "30 seconds", 42.0),
+    ("Decoded command: Set the temperature to 22 degrees (52 ms)", "TEMPERATURE", "22 degrees", None),
+    ("{'intent': 'LIGHT_ON', 'infer_ms': 7, 'audio_ms': 900}", "LIGHT_ON", "", 7.0),   # Python dict
+    ('{"pred": 12, "infer_ms": 5, "audio_ms": 1000}', "LIGHT_OFF", "", 5.0),          # class number
+    ('2026-10-02 12:00 {"intent": "PAUSE", "infer_ms": 4, "audio_ms": 900}', "PAUSE", "", 4.0),
+])
+def test_any_log_format(line, intent, slot, infer):
+    e = P.LineParser().parse(line, 0)
+    i, s, known, _ = S.resolve_prediction(e.intent, e.slot, e.variation, S.build_alias_table(),
+                                          S.id_orders()["manifest"])
+    assert (i, s, e.infer_ms) == (intent, slot, infer) and known
+
+
+@pytest.mark.parametrize("line", [
+    '{"mark": true, "turn_id": "t1", "correct": true, "intended_intent": null, "t": 1}',
+    "loaded intents: TIMER ALARM PAUSE STOP",
+    "cpu TEMP=55C load 0.3",
+    "time: 12.3s elapsed, stop requested",
+])
+def test_non_command_lines_ignored(line):
+    e = P.LineParser().parse(line, 0)
+    assert e is None or e.kind != "command"
+
+
+def test_multiline_json():
+    p = P.LineParser()
+    for part in ["{", '  "intent": "PAUSE",', '  "infer_ms": 9, "audio_ms": 800']:
+        assert p.parse(part, 0) is None
+    e = p.parse("}", 0)
+    assert (e.intent, e.infer_ms, e.audio_ms) == ("PAUSE", 9.0, 800.0)
+
+
+def test_auto_log_lock_uses_one_file():
+    link = P.SimLink(P.LineParser())
+    link.handle({"type": "log", "path": "/a/debug.log", "line": "cpu 55C", "auto": True}, 1.0)
+    link.handle({"type": "log", "path": "/a/convo.jsonl", "line": '{"intent": "TIME"}', "auto": True}, 1.0)
+    link.handle({"type": "log", "path": "/a/stdout.log", "line": "TIME -> ok", "auto": True}, 1.0)
+    evs = link.drain()
+    assert [e.intent for e in evs] == ["TIME"] and link.log_file == "/a/convo.jsonl"
+    assert link.ignored == {"/a/stdout.log": 1}
+    link.handle({"type": "log", "path": "/b/x.log", "line": "intent=PAUSE"}, 1.0)        # explicit source wins
+    link.handle({"type": "log", "path": "/a/convo.jsonl", "line": '{"intent": "STOP"}', "auto": True}, 1.0)
+    assert [e.intent for e in link.drain()] == ["PAUSE"]

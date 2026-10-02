@@ -144,6 +144,8 @@ def resolve_prediction(intent: str | None, slot: str | None, variation, aliases:
     into its intent + slot value. Returns (intent, slot, known, variation phrase
     or "").
     """
+    if (variation in (None, "")) and intent is not None and str(intent).strip().isdigit():
+        variation, intent = str(intent).strip(), ""        # a bare number = class number of the 93
     if id_order is not None and str(variation).strip().lstrip("-").isdigit():
         hit = lookup_id(int(str(variation).strip()), id_order)
         if hit is None:

@@ -36,7 +36,7 @@ REMOTE_AGENT = "~/.vcm_bench/pi_agent.py"
 
 # ------------------------------------------------------------------ parsing
 
-_KEY = r"(?:intent|command|cmd|label|prediction|predicted|pred|action|result)"
+_KEY = r"\b(?:intent|command|cmd|label|prediction|predicted|pred|action|result)"
 _INTENT_RE = re.compile(_KEY + r"[\"']?\s*[=:]\s*[\"']?(?P<intent>[A-Za-z][A-Za-z0-9_\-]*)", re.I)
 # slot value runs until a delimiter or the next "key=" / "key:"
 _SLOT_RE = re.compile(r"\b(?:slot_value|slot|value)[\"']?\s*[=:]\s*[\"']?(?P<slot>.+?)[\"']?"
@@ -45,9 +45,14 @@ _VAR_RE = re.compile(r"\b(?:variation|variation_id|phrase|command_class)[\"']?\s
                      r"(?=\s*[,;|}\)\]]|\s+[A-Za-z_]+\s*[=:]|\s*$)", re.I)
 _INFER_RE = re.compile(r"(?:infer(?:ence)?_?ms|latency_?ms|model_?ms)[\"']?\s*[=:]\s*(?P<v>[0-9.]+)", re.I)
 _AUDIO_RE = re.compile(r"(?:audio|window|utterance)_?ms[\"']?\s*[=:]\s*(?P<v>[0-9.]+)", re.I)
+# free text: "took 85 ms", "model 60ms", "infer: 85.2 ms" / "audio 1500 ms", "window=1.5s"
+_FREE_INFER_RE = re.compile(r"(?:infer\w*|model|took|latency|predict\w*)\D{0,12}?(?P<v>\d+(?:\.\d+)?)\s*ms\b", re.I)
+_FREE_AUDIO_RE = re.compile(r"(?:audio|window|utterance|clip)\D{0,12}?(?P<v>\d+(?:\.\d+)?)\s*(?P<u>ms|s)\b", re.I)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 DEFAULT_WAKE_REGEX = r"(?i)\b(wake[ _-]?word|wake detected|woke|hotword|wake=1|listening)\b"
 
-_JSON_INTENT_KEYS = ("intent", "command", "cmd", "label", "prediction", "pred", "action")
+_JSON_INTENT_KEYS = ("intent", "command", "cmd", "label", "prediction", "predicted", "pred", "action",
+                     "class", "class_name", "intent_name")
 _JSON_SLOT_KEYS = ("slot", "slot_value", "value", "slots")
 _JSON_VARIATION_KEYS = ("variation", "variation_id", "phrase", "command_class")
 _JSON_INFER_KEYS = ("infer_ms", "inference_ms", "latency_ms", "model_ms")
@@ -78,53 +83,175 @@ class LineParser:
     def __init__(self, command_regex: str | None = None, wake_regex: str | None = None):
         self.command_re = re.compile(command_regex, re.IGNORECASE) if command_regex else None
         self.wake_re = re.compile(wake_regex or DEFAULT_WAKE_REGEX)
+        self._buf = ""                       # a JSON object spread over several lines
 
     def parse(self, line: str, t: float) -> Event | None:
-        s = line.strip()
-        j = s.find("{")
-        if j >= 0:
-            try:
-                obj = json.loads(s[j:])
-            except ValueError:
-                obj = None
-            if isinstance(obj, dict):
-                ev = self._from_json(obj, t, s)
-                if ev:
-                    return ev
-        if self.command_re is not None:          # the student's own regex
+        """Any format, tried in this order: the student's own regex; a JSON (or Python dict)
+        object, also nested and multi-line; `key=value` / `key: value` text; free text that
+        names exactly one intent or one of the 93 phrases. A JSON line with no prediction in
+        it is never read as a command."""
+        s = _ANSI_RE.sub("", line).strip()
+        if self._buf:                                    # continue a multi-line JSON object
+            self._buf += " " + s
+            if self._buf.count("{") > self._buf.count("}") and len(self._buf) < 20000:
+                return None
+            s, self._buf = self._buf, ""
+        if self.command_re is not None:
             m = self.command_re.search(s)
             if m and (m.groupdict().get("intent") or m.groupdict().get("variation")):
                 g = m.groupdict()
                 return Event("command", t, (g.get("intent") or "").strip(), (g.get("slot") or "").strip(),
                              _f(g.get("infer_ms")), _f(g.get("audio_ms")), s, (g.get("variation") or "").strip())
-        else:
+        j = s.find("{")
+        if j >= 0 and j <= 40 and s.rstrip().endswith("}") or (j == 0 and s.count("{") > s.count("}")):
+            obj = _load_object(s[j:])
+            if obj is None and s.count("{") > s.count("}"):
+                self._buf = s                            # wait for the rest of the object
+                return None
+            if isinstance(obj, dict):
+                ev = self._from_json(obj, t, s)
+                if ev:
+                    return ev
+                return Event("wake", t, raw=s) if self.wake_re.search(s) else None
+        if self.command_re is None:
             m, vm = _INTENT_RE.search(s), _VAR_RE.search(s)
+            if m and not vm and not _known_name(m.group("intent")):
+                ev = _from_free_text(s, t)            # e.g. "command: Set the temperature to 22 degrees"
+                if ev:
+                    return ev
             if m or vm:
                 sm, im, am = _SLOT_RE.search(s), _INFER_RE.search(s), _AUDIO_RE.search(s)
                 return Event("command", t, m.group("intent") if m else "", sm.group("slot").strip() if sm else "",
                              _f(im and im.group("v")), _f(am and am.group("v")), s,
                              vm.group("v").strip() if vm else "")
+            ev = _from_free_text(s, t)
+            if ev:
+                return ev
         if self.wake_re.search(s):
             return Event("wake", t, raw=s)
         return None
 
     def _from_json(self, o: dict, t: float, raw: str) -> Event | None:
         kind = str(o.get("event") or o.get("type") or "").lower()
-        intent = next((o[k] for k in _JSON_INTENT_KEYS if o.get(k) not in (None, "")), None)
-        variation = next((o[k] for k in _JSON_VARIATION_KEYS if o.get(k) not in (None, "")), None)
+        intent = _pick(o, _JSON_INTENT_KEYS)
+        variation = _pick(o, _JSON_VARIATION_KEYS)
         if intent is None and variation is not None:
             intent = ""
         if intent is not None and not isinstance(intent, (dict, list)):
-            slot = next((o[k] for k in _JSON_SLOT_KEYS if o.get(k) not in (None, "")), "")
+            slot = _pick(o, _JSON_SLOT_KEYS, scalars_only=False) or ""
             if isinstance(slot, dict):
-                slot = " ".join(str(v) for v in slot.values())
-            infer = next((o[k] for k in _JSON_INFER_KEYS if o.get(k) is not None), None)
-            audio = next((o[k] for k in _JSON_AUDIO_KEYS if o.get(k) is not None), None)
+                slot = " ".join(str(v) for v in slot.values() if v not in (None, ""))
+            elif isinstance(slot, list):
+                slot = " ".join(str(v) for v in slot)
+            infer = _pick(o, _JSON_INFER_KEYS)
+            audio = _pick(o, _JSON_AUDIO_KEYS)
             return Event("command", t, str(intent), str(slot), _f(infer), _f(audio), raw,
                          "" if variation is None else str(variation))
         if "wake" in kind or o.get("wake") in (True, 1, "1"):
             return Event("wake", t, raw=raw)
         return None
+
+
+def _load_object(text: str):
+    """A JSON object, or a Python dict literal ({'intent': 'TIME'}), or None."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    end = text.rfind("}")
+    if end > 0:
+        try:
+            return json.loads(text[: end + 1])
+        except ValueError:
+            pass
+        try:
+            import ast
+            v = ast.literal_eval(text[: end + 1])
+            return v if isinstance(v, dict) else None
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            pass
+    return None
+
+
+_FREE_TABLE = None
+_ALIASES = None
+
+
+def _known_name(name: str) -> bool:
+    """Is this one of the 19 intents / a known alias (also joint names like TEMPERATURE_22)?"""
+    global _ALIASES
+    from . import schema as S
+    if _ALIASES is None:
+        _ALIASES = S.build_alias_table()
+    return S.normalize_prediction(name, "", _ALIASES)[2]
+
+
+def _free_text_table():
+    """(compiled regex of intent-like names, name -> intent) for free-text lines. Names must be
+    written like labels (UPPER_CASE or snake_case), so ordinary words ("time", "stop") don't count."""
+    global _FREE_TABLE
+    if _FREE_TABLE is None:
+        from . import schema as S
+        names = {}
+        vague = {"TEMP", "TEXT", "PLAY", "MUSIC", "DIM", "SKIP", "REMIND", "LOUDER", "QUIETER", "OTHER", "NONE",
+                 "NULL", "NOISE", "SILENCE", "BACKGROUND", "UNK", "FALLBACK", "WAKE_UP", "AIRCON"}
+        for raw, intent in list(S.BUILTIN_ALIASES.items()) + [(i, i) for i in S.INTENTS]:
+            if raw in vague:
+                continue                      # too common in ordinary log text
+            names[raw.upper()] = intent
+            if "_" in raw:
+                names[raw.lower()] = intent
+        alt = "|".join(sorted((re.escape(n) for n in names), key=len, reverse=True))
+        _FREE_TABLE = (re.compile(r"(?<![A-Za-z0-9_])(" + alt + r")(?:_(?P<tail>[A-Za-z0-9_]+))?(?![A-Za-z0-9])"),
+                       names)
+    return _FREE_TABLE
+
+
+def _from_free_text(s: str, t: float) -> "Event | None":
+    from . import schema as S
+    rx, names = _free_text_table()
+    hits = [(m, names[m.group(1)]) for m in rx.finditer(s)]
+    intents = {i for _, i in hits}
+    infer = _FREE_INFER_RE.search(s)
+    audio = _FREE_AUDIO_RE.search(s)
+    audio_ms = None
+    if audio:
+        audio_ms = float(audio.group("v")) * (1000.0 if audio.group("u").lower() == "s" else 1.0)
+    if len(intents) == 1:
+        m, _ = hits[0]
+        label = m.group(0)
+        rest = s[m.end():]
+        rest = re.split(r"\s(?:->|=>|\|)\s|\bconf\w*|\bp=|\bprob\w*|\btook\b|\bin \d|\d+(?:\.\d+)?\s*ms\b|;",
+                        rest, maxsplit=1)[0]
+        slot = rest.strip(" \t:=,()[]'\"")
+        if slot.startswith("{"):                          # TEMPERATURE {'temperature': '18'}
+            obj = _load_object(slot)
+            if isinstance(obj, dict):
+                slot = " ".join(str(v) for v in obj.values() if not isinstance(v, (dict, list)))
+        slot = slot.strip(" {}")
+        return Event("command", t, label, slot, _f(infer and infer.group("v")), audio_ms, s)
+    if not intents:
+        low = s.lower()                                   # one of the 93 phrases written out
+        found = [v for v in S.VARIATIONS if re.search(r"(?<![a-z])" + re.escape(v.phrase.lower()) + r"(?![a-z])", low)]
+        if len({v.phrase for v in found}) == 1:
+            return Event("command", t, "", "", _f(infer and infer.group("v")), audio_ms, s, found[0].phrase)
+    return None
+
+
+def _pick(o: dict, keys: tuple, depth: int = 2, scalars_only: bool = True):
+    """First non-empty value for one of `keys`, at the top level or nested up to `depth`
+    levels down (e.g. {"heard": {"intent": ..., "slots": {...}}})."""
+    for k in keys:
+        v = o.get(k)
+        if v not in (None, "") and (not scalars_only or not isinstance(v, (dict, list))):
+            return v
+    if depth > 0:
+        for v in o.values():
+            if isinstance(v, dict):
+                r = _pick(v, keys, depth - 1, scalars_only)
+                if r is not None:
+                    return r
+    return None
 
 
 def _f(v) -> float | None:
@@ -143,7 +270,10 @@ class PiLink:
     specs: dict = field(default_factory=dict)
     samples: list = field(default_factory=list)       # metric dicts, "t" on laptop clock
     events: "queue.Queue[Event]" = field(default_factory=queue.Queue)
-    raw_lines: list = field(default_factory=list)     # (laptop t, line) - all log lines seen
+    raw_lines: list = field(default_factory=list)     # (laptop t, line, path) - all log lines seen
+    auto_locked: str = ""        # auto-discovered file whose lines are used (first one with a command)
+    explicit_seen: bool = False  # a command came from an explicit --log / --log-dir / --log-cmd source
+    ignored: dict = field(default_factory=dict)       # path -> commands ignored from other files
     errors: list = field(default_factory=list)
     offset: float = 0.0          # pi_clock - laptop_clock
     rtt: float | None = None
@@ -163,9 +293,11 @@ class PiLink:
             m = dict(msg, t=t)
             self.samples.append(m)
         elif typ == "log":
-            line = str(msg.get("line", ""))
-            self.raw_lines.append((t, line))
+            line, path = str(msg.get("line", "")), str(msg.get("path", ""))
+            self.raw_lines.append((t, line, path))
             ev = self.parser.parse(line, t)
+            if ev and not self.accept(ev, path, bool(msg.get("auto"))):
+                return
             if ev:
                 self.events.put(ev)
         elif typ == "clock":          # sent by the agent in --post mode
@@ -176,6 +308,24 @@ class PiLink:
         elif typ == "error":
             self.errors.append(msg)
 
+    def accept(self, ev: Event, path: str, auto: bool) -> bool:
+        """Use commands from one source only, so a command logged in two files isn't counted
+        twice: explicit sources first, else the first auto-found file that had a command."""
+        if not auto:
+            if ev.kind == "command":
+                self.explicit_seen = True
+                self.log_file = self.log_file or path
+            return True
+        if self.explicit_seen:
+            return False
+        if ev.kind == "command" and not self.auto_locked:
+            self.auto_locked = self.log_file = path
+        if self.auto_locked and path != self.auto_locked:
+            if ev.kind == "command":
+                self.ignored[path] = self.ignored.get(path, 0) + 1
+            return False
+        return bool(self.auto_locked) or ev.kind == "wake"
+
     def drain(self) -> list[Event]:
         out = []
         while True:
@@ -185,8 +335,10 @@ class PiLink:
                 return out
 
     def agent_args(self, logs: list[str], log_cmds: list[str], proc: str | None,
-                   interval: float, log_dirs: list[str] = ()) -> list[str]:
+                   interval: float, log_dirs: list[str] = (), auto_logs: bool = False) -> list[str]:
         a = ["--interval", str(interval)]
+        if auto_logs:
+            a.append("--auto-logs")
         for d in log_dirs:
             a += ["--log-dir", d]
         for p in logs:
@@ -201,7 +353,7 @@ class PiLink:
 class SshLink(PiLink):
     def __init__(self, parser: LineParser, target: str, ssh_opts: list[str], control_dir: Path,
                  logs: list[str], log_cmds: list[str], proc: str | None, interval: float = 1.0,
-                 python: str = "python3", log_dirs: list[str] = ()):
+                 python: str = "python3", log_dirs: list[str] = (), auto_logs: bool = False):
         super().__init__(parser)
         self.target = target
         self.python = python
@@ -214,7 +366,7 @@ class SshLink(PiLink):
             share = ["-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/cm-%C",
                      "-o", "ControlPersist=900"]
         self.ssh = ["ssh", *share, "-o", "ServerAliveInterval=10", *ssh_opts, target]
-        self.args = self.agent_args(logs, log_cmds, proc, interval, log_dirs)
+        self.args = self.agent_args(logs, log_cmds, proc, interval, log_dirs, auto_logs)
         self.proc: subprocess.Popen | None = None
         self._ping_sent: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -299,6 +451,15 @@ class SshLink(PiLink):
             return r.returncode == 0
         except Exception:
             return False
+
+    def follow(self, logs: list[str], log_dirs: list[str], log_cmds: list[str], proc: str | None) -> None:
+        """Restart the agent reading other log file(s) (same SSH login)."""
+        self.args = self.agent_args(logs, log_cmds, proc, 1.0, log_dirs)
+        self.auto_locked, self.explicit_seen = "", False
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+        self.log_file = ""
+        self.start()
 
     def restart(self) -> None:
         """Start a fresh agent after the connection dropped. BatchMode: never hang on a password prompt."""

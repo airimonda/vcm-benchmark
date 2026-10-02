@@ -196,12 +196,14 @@ def find_pi_over_ssh(args, cfg: dict) -> tuple[tuple[str, list[str]] | None, dic
 
 def setup_pi(args, cfg: dict, run_dir: Path):
     banner(1, "Your Raspberry Pi")
-    info("Your Pi is already connected and your assistant is running, writing one line per command\n"
-         f"to {DEFAULT_LOG_DIR}/<id>_<date-time>.log (the newest log file there is read).\n"
+    info("Your Pi is already connected and your assistant is running. Its log is read directly:\n"
+         f"the newest file in {DEFAULT_LOG_DIR}/, or else whichever log file your assistant writes.\n"
          "See README > Before you start.")
     cfg["logs"] = args.log or []
     cfg["log_cmds"] = args.log_cmd or []
+    explicit = bool(cfg["logs"] or cfg["log_cmds"] or args.log_dir)
     cfg["log_dirs"] = [] if (cfg["logs"] or cfg["log_cmds"]) else (args.log_dir or [DEFAULT_LOG_DIR])
+    cfg["auto_logs"] = not explicit         # also read whatever log file the assistant writes
     cfg["proc"] = args.proc or ""          # blank: the process that has the log file open
     parser = LineParser(cfg.get("command_regex"), cfg.get("wake_regex"))
 
@@ -237,7 +239,8 @@ def setup_pi(args, cfg: dict, run_dir: Path):
     if mode == "ssh":
         target = cfg["host"]
         link = SshLink(parser, target, cfg["ssh_opts"], CACHE / "ssh", cfg["logs"], cfg["log_cmds"],
-                       cfg["proc"] or None, python=cfg.get("pi_python", "python3"), log_dirs=cfg["log_dirs"])
+                       cfg["proc"] or None, python=cfg.get("pi_python", "python3"), log_dirs=cfg["log_dirs"],
+                       auto_logs=cfg["auto_logs"])
         if password:
             info(f"Logging in to {target} (type the Pi's password when asked) ...")
             ok, out = link.check()
@@ -259,7 +262,7 @@ def setup_pi(args, cfg: dict, run_dir: Path):
         urls = ",".join(f"http://{ip}:{port}" for ip in laptop_ips()) or f"http://LAPTOP_IP:{port}"
         argv = " ".join(shlex.quote(a) if not a.startswith("~/") else a
                         for a in link.agent_args(cfg["logs"], cfg["log_cmds"], cfg["proc"] or None, 1.0,
-                                                 cfg["log_dirs"]))
+                                                 cfg["log_dirs"], cfg["auto_logs"]))
         info("\nThis laptop cannot log in to the Pi by itself, so let the Pi send its data here.\n"
              "In a terminal on the Pi, paste this one line and leave it running:\n")
         print(f"    curl -sL {AGENT_URL} | python3 - --post {urls} {argv}\n")
@@ -653,6 +656,56 @@ def mic_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]) 
             device = mics[int(pick) - 1][0] if pick.isdigit() and 1 <= int(pick) <= len(mics) else pick
 
 
+def watched_logs(link, cfg: dict) -> str:
+    if getattr(link, "log_file", ""):
+        return link.log_file
+    parts = [f"newest .log in {d}/" for d in cfg.get("log_dirs") or []] + list(cfg.get("logs") or [])
+    parts += [f"output of `{c}`" for c in cfg.get("log_cmds") or []]
+    return ", ".join(parts) or "nothing"
+
+
+def explain_no_log_lines(link, cfg: dict) -> None:
+    """Nothing arrived from the Pi's log: say what is watched and what log files exist."""
+    got = len(link.raw_lines)
+    info(f"  !! No command came from your Pi's log ({got} log line(s) seen in total). "
+         f"Reading: {watched_logs(link, cfg)}" + (" + any log file that grows" if cfg.get("auto_logs") else ""))
+    if not isinstance(link, SshLink):
+        info("     If your assistant writes somewhere else, run the benchmark again with --log PATH\n"
+             "     (or make it write to ~/vcm_benchmark/<id>_<date-time>.log).")
+        return
+    for d in cfg.get("log_dirs") or []:
+        r = link.run(f"ls -t {d}/*.log 2>/dev/null | head -3", timeout=30)
+        found = r.stdout.decode(errors="replace").split()
+        info(f"     {d}/: " + (", ".join(found) if found else "no .log files there"))
+    r = link.run("ls -t ~/*.log ~/*.jsonl ~/*/*.log ~/*/*.jsonl ~/*/logs/*.log ~/*/logs/*.jsonl "
+                 "~/*/*/logs/*.log ~/*/*/logs/*.jsonl 2>/dev/null | grep -v '/.vcm_bench/' | head -6",
+                 timeout=30)
+    recent = r.stdout.decode(errors="replace").split()
+    if recent:
+        info("     Log files on your Pi, most recently changed first:")
+        for f in recent:
+            info(f"       {f}")
+    info("     Either make your assistant write to ~/vcm_benchmark/<id>_<date-time>.log, or choose 'l'\n"
+         "     and give the file it writes now (JSON lines with the intent, also nested, work).")
+
+
+def change_log_source(link, cfg: dict) -> None:
+    path = ask("Log file (or folder, ending in /) on the Pi", (cfg.get("logs") or [""])[0])
+    if not path:
+        return
+    if path.endswith("/"):
+        cfg["log_dirs"], cfg["logs"] = [path.rstrip("/")], []
+    else:
+        cfg["logs"], cfg["log_dirs"] = [path], []
+    cfg["log_cmds"] = []
+    if isinstance(link, SshLink):
+        link.follow(cfg["logs"], cfg["log_dirs"], [], cfg.get("proc") or None)
+        time.sleep(1.0)
+        info(f"  Now reading: {path}. Replay the warm-up commands to check.")
+    else:
+        info(f"  Run the benchmark again with --log {path} (and the same command on the Pi with --log {path}).")
+
+
 def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict], aliases: dict) -> None:
     banner(4, "Sound check")
     info("Place the laptop speaker about 1 m from the Pi's microphone. Set the laptop volume\n"
@@ -673,8 +726,9 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
             collect(t, link, aliases, time.time() + (2 if args.no_audio else 8), pool)
             if not link.manual:
                 new = link.raw_lines[n_lines:]
-                info(f"  Pi log lines received: {len(new)}")
-                for _, line in new[-6:]:
+                use = [r for r in new if not link.log_file or r[2] == link.log_file]
+                info(f"  Pi log lines received: {len(use)}" + (f" (from {link.log_file})" if link.log_file else ""))
+                for _, line, _p in use[-6:]:
                     info(f"    | {line[:120]}")
             got = f"{t['pred_intent']} {t['pred_slot']}".strip()
             if t.get("pred_variation"):
@@ -710,20 +764,28 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
             if t["pred_intent"].startswith("OTHER:"):
                 info(f"  '{t['pred_intent'][6:]}' is not one of the 19 intents. Add an alias, e.g. in "
                      f"bench_settings.json: \"aliases\": {{\"{t['pred_intent'][6:]}\": \"TIMER\"}}")
+        no_lines = not link.manual and all(t.get("n_command_events", 0) == 0 for t in warm)
+        if no_lines:
+            explain_no_log_lines(link, cfg)
         options = [("c", "continue to the test")] if timing_ok else []
         if any(t.get("pred_variation_id") is not None for t in warm):
             options.append(("n", "set how my model numbers its 93 classes"))
-        options += [("r", "replay (after changing the volume / position / your Pi's output)"),
-                    ("x", "my Pi printed a line but it was not understood: enter a regex"),
+        options += [("r", "replay (after changing the volume / position / your Pi's output)")]
+        if not link.manual:
+            options.append(("l", "read a different log file on the Pi"))
+        options += [("x", "my Pi printed a line but it was not understood: enter a regex"),
                     ("q", "quit")]
         if not timing_ok:
             options.append(("i", "continue WITHOUT infer_ms/audio_ms (report marks timing as missing)"))
-        a = choose("Next", options, "c" if timing_ok else ("i" if YES else "r"))
+        a = choose("Next", options, "i" if YES and not timing_ok else ("r" if no_lines or not timing_ok else "c"))
         if a in ("c", "i"):
             cfg["timing_waived"] = a == "i"
             return
         if a == "n":
             choose_id_order(cfg)
+            continue
+        if a == "l":
+            change_log_source(link, cfg)
             continue
         if a == "q":
             raise SystemExit(0)
