@@ -68,7 +68,11 @@ The script walks you through these steps:
 2. **Record your wake word** 3 times on the laptop microphone (or `--wake-files a.wav b.wav`).
 3. **Build the test audio**: each holdout clip gets one of your wake word takes in front of it,
    with a pause in between (default 0.8 s; set it to what your Pi needs after its chime).
-   Wake word and command are levelled to the same loudness.
+   Wake word and command are levelled to the same loudness. For the **false-wake check**, as many
+   in-scope commands as there are out-of-scope clips (10) are added **without** the wake word,
+   one per intent; your Pi should ignore them. All trials are **shuffled** with a **seed you
+   choose** (a random one is suggested; type the same seed again to repeat a test exactly, or use
+   a seed the class agrees on so everyone hears the same order).
 4. **Sound check**: two warm-up commands, not scored. You see the log lines your Pi printed and
    how they were understood. Fix the volume or the output format here.
 5. **Approve**: every remaining question comes now: ONNX model path (optional), and whether to
@@ -89,8 +93,9 @@ The script walks you through these steps:
 8. **Clean up**: the generated audio (your wake word recordings and the trial files) is deleted or
    kept as you chose in step 5. Results are always kept.
 
-Test size: **full** = all 196 holdout clips (186 commands = 2 per variation, plus 10 out-of-scope),
-about 55 min. **quick** = 1 clip per variation + the 10 out-of-scope clips (103), about 30 min.
+Test size: **full** = all 196 holdout clips (186 commands = 2 per variation, plus 10 out-of-scope)
++ 10 false-wake trials, about 60 min. **quick** = 1 clip per variation + the 10 out-of-scope clips
+(103) + 10 false-wake trials, about 32 min.
 
 The holdout set downloads automatically from Hugging Face
 ([airimonda/ai231-me2-voice-commands](https://huggingface.co/datasets/airimonda/ai231-me2-voice-commands),
@@ -116,30 +121,52 @@ Extra ssh options: `--ssh-opt=-p2222 --ssh-opt=-i~/.ssh/mykey`.
 ## What your Pi must print
 
 Your assistant must write **one line per recognised command** to a log file (or to a systemd
-journal / any command output you can follow). Any of these work out of the box:
+journal / any command output you can follow). Every line must carry the intent, the slot (for
+slotted intents), and two timing fields:
+
+| Field | Meaning | Required |
+|---|---|---|
+| `intent` | what your model decided (one of the 19, or out of scope) | yes |
+| `slot` | the slot value, free text (`22`, `twenty two`, `9pm`, `blue`) | for slotted intents |
+| `infer_ms` | time your model took for this command: feature extraction + model, in milliseconds | **yes** |
+| `audio_ms` | length of the audio your model processed for this command, in milliseconds | **yes** |
+
+Any of these formats work out of the box:
 
 ```
 {"intent": "TIMER", "slot": "30 seconds", "infer_ms": 85, "audio_ms": 1500}
-intent=TIMER slot=30 seconds infer_ms=85
-2026-10-02 12:00:01 INFO command: LIGHT_ON
-prediction=set_temperature_22
-intent=OUT_OF_SCOPE
+intent=TIMER slot=30 seconds infer_ms=85 audio_ms=1500
 ```
+
+Python example for your runtime:
+
+```python
+import json, time
+
+t0 = time.perf_counter()
+intent, slot = model.predict(audio)            # your features + model
+infer_ms = (time.perf_counter() - t0) * 1000
+audio_ms = len(audio) / sample_rate * 1000
+print(json.dumps({"intent": intent, "slot": slot,
+                  "infer_ms": round(infer_ms, 1), "audio_ms": round(audio_ms)}), file=log, flush=True)
+```
+
+The real-time factor in the report is `infer_ms / audio_ms`. The sound check refuses to start
+the test until both fields are present (you can override it, and the report then marks timing
+as missing).
 
 * **Intent names** do not have to match exactly: `SET_TIMER`, `lights_on`, `get_weather`,
   `unknown`, `none`, ... are mapped to the 19 intents / out of scope. Joint names like
   `TEMPERATURE_22` or `COLOR_BLUE` are split into intent and slot. If your names are unusual,
   add them in `bench_settings.json`: `"aliases": {"AC_SET": "TEMPERATURE"}`. Unknown names are
   scored as wrong and listed in the report.
-* **Slot** is free text: `22`, `22 degrees`, `twenty two`, `9pm`, `21:00`, `blue`, `drink water`.
-* `infer_ms` (model time) and `audio_ms` (length of the audio window the model saw) are optional;
-  with them the report shows inference time and real-time factor.
+* Out of scope: print `intent=OUT_OF_SCOPE` (or `unknown`/`none`), or print nothing.
 * Optional wake line, e.g. `wake word detected` or `{"event": "wake"}`: gives the wake detection rate.
-* Print the line **when the decision is made** (flush the file: `print(..., flush=True)` or
-  `logging` with a `FileHandler`). Response latency is measured from the end of the spoken
-  command to the moment the line appears.
+* Print the line **when the decision is made** and flush it. Response latency is measured from
+  the end of the spoken command to the moment the line appears.
 * Totally different format? In the sound check choose `x` and enter a Python regex with named
-  groups, e.g. `RESULT: (?P<intent>\w+) \((?P<slot>[^)]*)\)`.
+  groups `intent`, `slot`, `infer_ms`, `audio_ms`, e.g.
+  `RESULT: (?P<intent>\w+) \((?P<slot>[^)]*)\) (?P<infer_ms>[0-9.]+)ms/(?P<audio_ms>[0-9.]+)ms`.
 
 Tell the script how to find your process (e.g. `main.py`) to get **its** CPU and RAM, not just the
 whole Pi's.
@@ -157,6 +184,8 @@ scores, and the split between real and synthetic voices.
 
 * REJECT = the clip was out of scope; on the prediction side it means the Pi said out of
   scope or did not respond.
+* **False wake rate** = commands played without the wake word where the Pi fired anyway (count,
+  rate, 95% interval, and which ones). Not part of the 19/93 scores.
 * **False accept rate** = out-of-scope clips where the Pi fired a command. **False reject rate** =
   in-scope clips where it rejected or stayed silent. **Misfire rate** = in-scope clips where it
   fired the wrong command.
@@ -180,7 +209,8 @@ intent was right):
 
 * response latency (end of command audio to Pi output; p50, p95, p99), clock-synced between
   laptop and Pi;
-* inference time and **real-time factor** (infer_ms / audio_ms), if your Pi prints them;
+* inference time and **real-time factor** (infer_ms / audio_ms), from the timing fields every
+  command line carries;
 * CPU temperature, CPU clock (shows throttling), throttling flags (`vcgencmd get_throttled`);
 * CPU use of the whole Pi and of your process; RAM of your process (RSS) and of the Pi; load average;
 * runtime CPU-seconds per second of speech, and your process's CPU share of the test wall time

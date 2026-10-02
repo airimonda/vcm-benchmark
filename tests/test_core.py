@@ -241,3 +241,70 @@ def test_main_burst_noisy_wake_take(noise_db):
     x[800:1100] += 0.5                                   # key click right after Enter
     y = A.main_burst(x)
     assert 0.35 <= len(y) / sr <= 0.9
+
+
+# ---------------------------------------------------------------- false wake + seed
+
+def _plan(tmp_path, seed, size="quick"):
+    import argparse
+    import benchmark as B
+    B.YES = True
+    args = argparse.Namespace(holdout=None, size=size, seed=seed, limit=None, wake_gap=0.5,
+                              gap_min=10.0, gap_max=15.0)
+    take = A.normalize(np.sin(np.arange(4000) / 7).astype(np.float32))
+    return B.build_trials(args, {}, tmp_path, [take])
+
+
+@pytest.mark.skipif(not (ROOT / ".cache" / "holdout.parquet").exists(), reason="holdout not downloaded")
+def test_plan_false_wake_and_seed(tmp_path):
+    a = _plan(tmp_path / "a", seed=7)
+    oos = sum(t["true_intent"] == S.OOS for t in a)
+    nw = [t for t in a if t["kind"] == "no_wake"]
+    assert len(nw) == oos == 10
+    assert all(t["true_intent"] != S.OOS for t in nw)
+    assert len({t["true_intent"] for t in nw}) == len(nw)          # one per intent
+    assert all(t["wake_take"] == 0 and t["cmd_start"] == pytest.approx(t["wake_start"]) for t in nw)
+    assert len(a) == 103 + 10
+    pos = [i for i, t in enumerate(a) if t["kind"] == "no_wake"]
+    assert pos != list(range(len(a) - 10, len(a)))                  # mixed in, not appended
+    b = _plan(tmp_path / "b", seed=7)
+    c = _plan(tmp_path / "c", seed=8)
+    key = lambda p: [(t["clip_idx"], t["kind"]) for t in p]
+    assert key(a) == key(b) and key(a) != key(c)
+
+
+def test_score_false_wake():
+    trials = [
+        _trial("TIME", "Time", "", "TIME", ""),
+        _trial("OUT_OF_SCOPE", "", "", S.NONE, ""),
+        _trial("PAUSE", "Pause", "", S.NONE, "", kind="no_wake"),
+        _trial("STOP", "Stop", "", "STOP", "", kind="no_wake"),
+    ]
+    m = score(trials, [], {}, None, 0, 10, {"seed": 3})
+    assert m["false_wake"]["n"] == 2 and m["false_wake"]["false_wakes"] == 1
+    assert m["false_wake"]["false_wake_rate"] == pytest.approx(0.5)
+    assert m["intent_level"]["n"] == 2                               # not mixed into 19/93 scores
+    assert m["intent_level"]["accuracy"] == 1.0
+    assert "false wake rate" in render_markdown(m)
+
+
+class _NoTimingPi(P.SimLink):
+    """Simulated Pi whose lines lack infer_ms / audio_ms."""
+
+    def respond(self, intent, slot, t_end, wake=True):
+        self.events.put(P.Event("command", t_end + 0.2, intent, slot, raw=f"intent={intent}"))
+
+
+@pytest.mark.parametrize("pi_cls,waived", [(P.SimLink, False), (_NoTimingPi, True)])
+def test_sound_check_requires_timing(tmp_path, monkeypatch, pi_cls, waived):
+    import argparse
+    import benchmark as B
+    monkeypatch.setattr(B, "YES", True)
+    link = pi_cls(P.LineParser(), accuracy=1.0)
+    link.rng.random = lambda: 0.5                         # always wake, always right
+    trials = [{"order": 0, "kind": "wake", "transcript": "Time", "true_intent": "TIME", "true_slot": "",
+               "true_variation": "Time", "audio_file": "x.wav", "cmd_end": 0.1}]
+    cfg = {"wake_word": "Watson"}
+    B.sound_check(argparse.Namespace(no_audio=True), cfg, link, None, tmp_path, trials,
+                  S.build_alias_table())
+    assert cfg["timing_waived"] is waived
