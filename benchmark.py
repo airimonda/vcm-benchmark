@@ -24,9 +24,11 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -442,6 +444,82 @@ class S_Event:  # tiny stand-in for manual answers
         self.infer_ms = self.audio_ms = None
 
 
+def pi_mics(specs: dict) -> list[tuple[str, str]]:
+    """[(ALSA device, description)] from the Pi's `arecord -l` output in its specs."""
+    out = [("default", "the Pi's default input (shared with your assistant if it uses PulseAudio/PipeWire)")]
+    for line in str(specs.get("audio_inputs") or "").splitlines():
+        m = re.match(r"card (\d+): .*?\[(.*?)\].*?device (\d+)", line)
+        if m:
+            out.append((f"plughw:{m.group(1)},{m.group(3)}", m.group(2)))
+    return out
+
+
+def mic_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]) -> None:
+    """Record on the Pi while the laptop plays a command: does the Pi's mic actually hear it?"""
+    if not isinstance(link, SshLink) or player is None:
+        return
+    banner("4a", "Mic check: does the Pi hear the laptop?")
+    info("The Pi records 2 s of room noise, then records again while the laptop plays a command\n"
+         "(without the wake word, so your assistant should not react). Keep the room quiet.")
+    clip_t = next((t for t in trials if t.get("kind") == "no_wake"), trials[0])
+    clip = A.load(run_dir / clip_t["audio_file"])
+    device = cfg.get("pi_mic", "default")
+    while True:
+        if not YES:
+            wait_enter(f"Press Enter to run the mic check (Pi input: {device})")
+        try:
+            ambient = link.record(2, device)
+            box: dict = {}
+
+            def rec():
+                try:
+                    box["x"] = link.record(len(clip) / A.SR + 4, device)
+                except Exception as e:  # reported below
+                    box["err"] = e
+
+            th = threading.Thread(target=rec)
+            th.start()
+            time.sleep(3.0 if IS_WINDOWS else 2.0)     # let arecord start on the Pi
+            player.play(clip)
+            th.join()
+            if "err" in box:
+                raise box["err"]
+            r = A.mic_levels(ambient, box["x"])
+        except Exception as e:
+            msg = str(e)
+            info(f"!! Recording on the Pi failed: {msg[:300]}")
+            if "busy" in msg.lower():
+                info("   Your assistant is holding the microphone. Choose 'default' (shared through\n"
+                     "   PulseAudio/PipeWire), or stop your assistant for the check and start it again after.")
+            elif "not found" in msg.lower() or "No such file" in msg:
+                info("   arecord is missing on the Pi: sudo apt install alsa-utils")
+            r = None
+        if r:
+            cfg["mic_check"] = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}
+            info(f"Room noise {r['noise_dbfs']:.0f} dBFS, laptop speech {r['speech_dbfs']:.0f} dBFS, "
+                 f"signal-to-noise {r['snr_db']:.0f} dB, peak {r['peak']:.2f}")
+            info({"ok": "OK: the Pi hears the laptop clearly.",
+                  "weak": "WEAK: the Pi hears it, but not by much. Turn the laptop volume up a little or move\n"
+                          "it closer (aim for 20 dB or more).",
+                  "not heard": "NOT HEARD: the Pi barely hears the laptop. Check the Pi mic (choose another\n"
+                               "input below), turn the laptop volume up, or move it closer.",
+                  "clipping": "CLIPPING: too loud for the Pi mic, the sound distorts. Turn the laptop volume\n"
+                              "down or move it further away."}[r["verdict"]])
+        ok = bool(r) and r["verdict"] in ("ok", "weak")
+        opts = ([("c", "continue")] if ok else []) + [("r", "repeat the check"), ("d", "choose another Pi microphone")]
+        opts += [("s", "skip the mic check")] if not ok else []
+        a = choose("Next", opts, "c" if ok else ("s" if YES else "r"))
+        if a in ("c", "s"):
+            cfg["pi_mic"] = device
+            return
+        if a == "d":
+            mics = pi_mics(link.specs)
+            for i, (dev, desc) in enumerate(mics, 1):
+                info(f"  [{i}] {dev:14s} {desc}")
+            pick = ask("Number, or an ALSA device name", "1")
+            device = mics[int(pick) - 1][0] if pick.isdigit() and 1 <= int(pick) <= len(mics) else pick
+
+
 def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict], aliases: dict) -> None:
     banner(4, "Sound check")
     info("Place the laptop speaker about 1 m from the Pi's microphone. Set the laptop volume\n"
@@ -834,6 +912,7 @@ def main() -> None:
             link.start()          # agent streams metrics + log lines from now on
             time.sleep(1.0)
         if not (args.yes and cfg["mode"] == "sim"):
+            mic_check(args, cfg, link, player, run_dir, trials)
             sound_check(args, cfg, link, player, run_dir, trials, aliases)
             aliases = S.build_alias_table(cfg.get("aliases"))
         prof = approve(args, cfg, link, trials, run_dir)
@@ -850,7 +929,7 @@ def main() -> None:
     if not samples and (run_dir / "pi_samples.jsonl").exists():
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
     meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
-                                     "seed")}
+                                     "seed", "pi_mic", "mic_check")}
     meta["holdout"] = cfg.get("holdout") or "huggingface"
     meta["gap_s"] = [args.gap_min, args.gap_max]
     m = score(done, samples, link.specs, prof, t_start, t_end, meta)

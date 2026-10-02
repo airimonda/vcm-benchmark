@@ -266,6 +266,16 @@ class SshLink(PiLink):
         for raw in self.proc.stderr:
             self.errors.append({"where": "ssh", "msg": raw.decode(errors="replace").strip()})
 
+    def record(self, seconds: float, device: str = "default"):
+        """Record from the Pi's microphone with arecord; 16 kHz mono float32 numpy array."""
+        import numpy as np
+        secs = max(1, int(round(seconds)))
+        r = self.run(f"arecord -q -D {shlex.quote(device)} -f S16_LE -r 16000 -c 1 -d {secs} -t raw",
+                     timeout=secs + 30)
+        if r.returncode != 0 or not r.stdout:
+            raise RuntimeError(r.stderr.decode(errors="replace").strip() or "arecord returned no audio")
+        return np.frombuffer(r.stdout[: len(r.stdout) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+
     def batch_ok(self) -> bool:
         """True if SSH logs in without a password prompt (needed for unattended reconnects)."""
         try:
