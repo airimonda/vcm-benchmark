@@ -59,7 +59,7 @@ On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard li
 Before you run the benchmark:
 
 1. **Your Pi is already connected** to this laptop (however you connected it) and you can log in
-   with `ssh user@host`, e.g. `ssh abnunez@100.75.251.43`, without typing a password.
+   with `ssh user@host`, e.g. `ssh name@raspberrypi`, without typing a password.
 
 2. **Your assistant appends one line per command to `~/vcm_benchmark.log` on the Pi** (the
    default; another path works too, the script asks). Format: see
