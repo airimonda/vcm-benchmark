@@ -609,6 +609,6 @@ def test_setup_ssh_key_and_known_hosts(tmp_path, monkeypatch):
         "work.example.com ssh-ed25519 AAAA\n")
     cands = B.ssh_candidates(argparse.Namespace(host=None), {})
     names = [c[0] for c in cands]
-    assert any(n.endswith("@mypi.local") for n in names)
+    assert "pi@mypi.local" in names and not any(n.split("@")[0] not in ("pi",) for n in names if "@" in n)
     assert any(n.endswith("@raspi4.lan") and o == ["-p", "2222"] for n, o, _ in cands)
     assert not any("work.example" in n for n in names)
