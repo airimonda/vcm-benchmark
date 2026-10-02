@@ -77,12 +77,16 @@ On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard li
 How the script reaches the Pi (no setup questions unless needed):
 
 1. It tries to log in over SSH by itself, without a password: the Pi you used last time, Pi
-   entries in your `~/.ssh/config`, and `raspberrypi.local`. It picks the one that has
-   `~/vcm_benchmark/`.
+   entries in your `~/.ssh/config`, Pi-like hosts you have logged in to before, and
+   `raspberrypi.local`. It picks the one that has `~/vcm_benchmark/`.
 2. If that fails, it shows what went wrong for each address (not found, no answer, needs a
    password, SSH off ...) and offers:
    * **log in with your username and password**: type `user@host` (or paste your whole
-     `ssh ...` command) and your password when asked;
+     `ssh ...` command). The script then offers to **set up password-less login** (recommended):
+     it creates an SSH key on the laptop if there is none and adds it to the Pi, so you type the
+     password **once**. From then on nothing is asked, the Pi is found automatically next time,
+     and dropped connections reconnect during the unattended run. (Without it, Windows asks the
+     password at every step.)
    * **let the Pi send its data**: paste one line in a terminal on the Pi; it downloads the small
      agent from this repo and sends to the laptop. Works on networks where the laptop cannot
      reach the Pi.

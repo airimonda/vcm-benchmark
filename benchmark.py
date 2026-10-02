@@ -126,7 +126,21 @@ def ssh_candidates(args, cfg: dict) -> list[tuple[str, list[str], bool]]:
                 name_ok = True
     except OSError:
         pass
+    # hosts this laptop has logged in to before, if their names look like a Pi
+    try:
+        kh = (Path.home() / ".ssh" / "known_hosts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        kh = ""
     import getpass
+    users = list(dict.fromkeys([getpass.getuser(), "pi"]))
+    for line in kh.splitlines():
+        field = line.split(" ", 1)[0]
+        for h in field.split(","):
+            if h.startswith("|") or not re.search(r"pi|rasp", h, re.I):
+                continue                                  # hashed entry, or not a Pi-like name
+            m = re.match(r"\[(.+)\]:(\d+)$", h)
+            host, opts = (m.group(1), ["-p", m.group(2)]) if m else (h, [])
+            out += [(f"{u}@{host}", opts, False) for u in users]
     for host in ("raspberrypi.local", "raspberrypi"):
         for user in dict.fromkeys([getpass.getuser(), "pi"]):
             out.append((f"{user}@{host}", [], False))
@@ -136,6 +150,35 @@ def ssh_candidates(args, cfg: dict) -> list[tuple[str, list[str], bool]]:
             seen.add(c[0])
             uniq.append(c)
     return uniq
+
+
+def setup_ssh_key(target: str, opts: list[str]) -> tuple[bool, str]:
+    """Create this laptop's SSH key if it has none and add it to the Pi's authorized_keys
+    (one password prompt). Returns (password-less login works, problem)."""
+    sshdir = Path.home() / ".ssh"
+    key = next((k for k in (sshdir / "id_ed25519", sshdir / "id_ecdsa", sshdir / "id_rsa")
+                if k.exists() and Path(f"{k}.pub").exists()), None)
+    if key is None:
+        if not shutil.which("ssh-keygen"):
+            return False, "no ssh-keygen on this laptop"
+        sshdir.mkdir(mode=0o700, exist_ok=True)
+        key = sshdir / "id_ed25519"
+        r = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "vcm-benchmark", "-f", str(key)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, (r.stderr or "ssh-keygen failed").strip()
+        info(f"Created an SSH key for this laptop: {key}")
+    pub = Path(f"{key}.pub").read_text(encoding="utf-8").strip()
+    info(f"Adding it to the Pi: type the Pi's password for {target} when asked ...")
+    install = ("umask 077; mkdir -p ~/.ssh; read k; "
+               "grep -qxF \"$k\" ~/.ssh/authorized_keys 2>/dev/null || echo \"$k\" >> ~/.ssh/authorized_keys")
+    r = subprocess.run(["ssh", *opts, target, install], input=pub + "\n", stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, timeout=180)
+    if r.returncode != 0:
+        return False, ssh_problem(r.stderr)
+    v = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *opts, target, "true"],
+                       capture_output=True, text=True, timeout=60)
+    return (True, "") if v.returncode == 0 else (False, ssh_problem(v.stderr))
 
 
 def ssh_problem(err: str) -> str:
@@ -230,6 +273,18 @@ def setup_pi(args, cfg: dict, run_dir: Path):
                 target, extra = parse_ssh_target(raw)
                 cfg["host"], cfg["ssh_opts"] = target, extra + (args.ssh_opt or [])
                 mode, password = "ssh", True
+                info("Recommended: set up password-less login now. You type the Pi's password once;\n"
+                     "after that this script (and `ssh`) log in by themselves: no password at every\n"
+                     "step, the Pi is found automatically next time, and dropped connections reconnect.")
+                if yesno("Set up password-less login to this Pi?", True):
+                    ok, why = setup_ssh_key(target, cfg["ssh_opts"])
+                    if ok:
+                        info("Done: this laptop now logs in to the Pi without a password.")
+                        password = False
+                    else:
+                        info(f"Key setup did not work ({why}); continuing with password login.")
+                if password and IS_WINDOWS:
+                    info("Note: Windows asks the Pi's password at each step (about 7 times).")
             else:
                 mode = "http"
     cfg["mode"] = mode

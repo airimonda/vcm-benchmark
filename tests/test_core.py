@@ -525,3 +525,40 @@ def test_pi_push_picks_reachable_address_and_stops(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+@posix_only
+def test_setup_ssh_key_and_known_hosts(tmp_path, monkeypatch):
+    """Password login -> one-time key setup: creates a key if missing and installs it once;
+    afterwards BatchMode (password-less) login works. Fake ssh / ssh-keygen, no network."""
+    import argparse
+    import benchmark as B
+    bindir, pi_auth = tmp_path / "bin", tmp_path / "pi_authorized_keys"
+    bindir.mkdir()
+    (bindir / "ssh-keygen").write_text('#!/bin/sh\nwhile [ "$1" != "-f" ]; do shift; done\n'
+                                       'echo PRIV > "$2"; echo "ssh-ed25519 AAAAtest vcm-benchmark" > "$2.pub"\n')
+    (bindir / "ssh").write_text(
+        '#!/bin/sh\n'
+        f'AUTH="{pi_auth}"\n'
+        'case "$*" in\n'
+        '  *authorized_keys*) read k; grep -qxF "$k" "$AUTH" 2>/dev/null || echo "$k" >> "$AUTH"; exit 0;;\n'
+        '  *BatchMode=yes*) [ -s "$AUTH" ] && exit 0; echo "Permission denied (publickey,password)." >&2; exit 255;;\n'
+        'esac\nexit 0\n')
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(B.Path, "home", classmethod(lambda cls: tmp_path))
+    ok, why = B.setup_ssh_key("student@mypi.local", [])
+    assert ok, why
+    assert (tmp_path / ".ssh" / "id_ed25519.pub").exists()
+    assert B.setup_ssh_key("student@mypi.local", [])[0]                  # again: no duplicate line
+    assert pi_auth.read_text().count("AAAAtest") == 1
+    (tmp_path / ".ssh" / "known_hosts").write_text(
+        "mypi.local ssh-ed25519 AAAA\n[raspi4.lan]:2222 ssh-ed25519 AAAA\n|1|hashed= ssh-ed25519 AAAA\n"
+        "work.example.com ssh-ed25519 AAAA\n")
+    cands = B.ssh_candidates(argparse.Namespace(host=None), {})
+    names = [c[0] for c in cands]
+    assert any(n.endswith("@mypi.local") for n in names)
+    assert any(n.endswith("@raspi4.lan") and o == ["-p", "2222"] for n, o, _ in cands)
+    assert not any("work.example" in n for n in names)
