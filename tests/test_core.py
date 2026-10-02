@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import subprocess
 import time
@@ -221,7 +222,7 @@ def test_sim_run(tmp_path):
     """Whole wizard in simulation mode, no sound, non-interactive."""
     r = subprocess.run([sys.executable, str(ROOT / "benchmark.py"), "--mode", "sim", "--no-audio", "--yes",
                         "--fresh", "--size", "quick", "--limit", "6", "--gap-min", "1", "--gap-max", "1.1",
-                        "--wake-word", "Watson", "--seed", "5", "--runs-dir", str(tmp_path)],
+                        "--wake-word", "hey pi", "--seed", "5", "--runs-dir", str(tmp_path)],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
     run = next(tmp_path.iterdir())
@@ -304,7 +305,7 @@ def test_sound_check_requires_timing(tmp_path, monkeypatch, pi_cls, waived):
     link.rng.random = lambda: 0.5                         # always wake, always right
     trials = [{"order": 0, "kind": "wake", "transcript": "Time", "true_intent": "TIME", "true_slot": "",
                "true_variation": "Time", "audio_file": "x.wav", "cmd_end": 0.1}]
-    cfg = {"wake_word": "Watson"}
+    cfg = {"wake_word": "hey pi"}
     B.sound_check(argparse.Namespace(no_audio=True), cfg, link, None, tmp_path, trials,
                   S.build_alias_table())
     assert cfg["timing_waived"] is waived
@@ -462,8 +463,8 @@ def test_rescore_cli(tmp_path):
 
 
 @pytest.mark.parametrize("raw,target,opts", [
-    ("abnunez@100.75.251.43", "abnunez@100.75.251.43", []),
-    ("ssh abnunez@100.75.251.43", "abnunez@100.75.251.43", []),
+    ("pi@192.168.1.20", "pi@192.168.1.20", []),
+    ("ssh pi@192.168.1.20", "pi@192.168.1.20", []),
     ("ssh pi@host -p 2222", "pi@host", ["-p", "2222"]),
     ("ssh -i ~/.ssh/k pi@raspberrypi.local", "pi@raspberrypi.local", ["-i", "~/.ssh/k"]),
     ("mypi", "mypi", []),
@@ -471,3 +472,56 @@ def test_rescore_cli(tmp_path):
 def test_parse_ssh_target(raw, target, opts):
     import benchmark as B
     assert B.parse_ssh_target(raw) == (target, opts)
+
+
+# ---------------------------------------------------------------- finding the Pi (fake ssh, no network)
+
+@posix_only
+def test_find_pi_over_ssh(tmp_path, monkeypatch):
+    import argparse
+    import benchmark as B
+    fake = tmp_path / "ssh"
+    fake.write_text('#!/bin/sh\n'
+                    'for a; do case "$a" in good@pi) echo VCM_DIR; exit 0;; '
+                    'noperm@pi) echo "Permission denied (publickey,password)." >&2; exit 255;; esac; done\n'
+                    'echo "ssh: Could not resolve hostname x: nodename nor servname provided" >&2; exit 255\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))                     # no real ~/.ssh/config
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("Host mypi\n  HostName 10.0.0.5\nHost work\n  HostName work.example\n")
+    args = argparse.Namespace(host=None)
+    cands = [c[0] for c in B.ssh_candidates(args, {"host": "noperm@pi"})]
+    assert cands[0] == "noperm@pi" and "mypi" in cands and "work" not in cands
+    found, problems = B.find_pi_over_ssh(args, {"host": "noperm@pi"})
+    assert found is None
+    assert "password" in problems["noperm@pi"] and "not found" in problems["mypi"]
+    found, _ = B.find_pi_over_ssh(argparse.Namespace(host="ssh good@pi"), {})
+    assert found == ("good@pi", [])
+
+
+@posix_only
+def test_pi_push_picks_reachable_address_and_stops(tmp_path):
+    """Pi-sends mode: the agent tries each laptop address, uses the one that answers, and exits
+    by itself when the laptop says the test is over."""
+    logdir = tmp_path / "vcm_benchmark"
+    logdir.mkdir()
+    link = P.HttpLink(P.LineParser(), port=0)
+    link.start()
+    urls = f"http://127.0.0.1:9,http://127.0.0.1:{link.port}"          # first one is dead
+    proc = subprocess.Popen([sys.executable, str(ROOT / "pi_agent.py"), "--post", urls,
+                             "--log-dir", str(logdir), "--interval", "0.2"],
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait(lambda: bool(link.specs), timeout=15)
+        (logdir / "s1_20261002-120000.log").write_text("", encoding="utf-8")
+        time.sleep(1.0)
+        with open(logdir / "s1_20261002-120000.log", "a", encoding="utf-8") as f:
+            f.write('{"intent": "TIME", "infer_ms": 5, "audio_ms": 1000}\n')
+        assert _wait(lambda: not link.events.empty(), timeout=10)
+        assert link.log_file.endswith("s1_20261002-120000.log")
+        link.stop()
+        assert proc.wait(timeout=10) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()

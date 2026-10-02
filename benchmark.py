@@ -40,7 +40,7 @@ sys.path.insert(0, str(ROOT))
 from vcmbench import audio as A                                  # noqa: E402
 from vcmbench import schema as S                                 # noqa: E402
 from vcmbench.dataset import load_holdout                        # noqa: E402
-from vcmbench.pi import (HttpLink, LineParser, ManualLink, SimLink, SshLink,  # noqa: E402
+from vcmbench.pi import (AGENT_URL, HttpLink, LineParser, ManualLink, SimLink, SshLink,  # noqa: E402
                          laptop_ips)
 from vcmbench.report import score, write_outputs                 # noqa: E402
 
@@ -53,7 +53,7 @@ for _stream in (sys.stdout, sys.stderr):        # Pi log lines may hold characte
 
 ID_ORDER: list[str] | None = None   # class-number order for models that print a number (see schema.ID_ORDER_HELP)
 SAVED_SETTINGS = ROOT / "bench_settings.json"
-DEFAULT_LOG = "~/vcm_benchmark.log"   # where the assistant on the Pi appends one line per command     # remembered answers (git-ignored)
+DEFAULT_LOG_DIR = "~/vcm_benchmark"   # the assistant writes <id>_<date-time>.log here; the newest is read     # remembered answers (git-ignored)
 CACHE = ROOT / ".cache"
 
 # ------------------------------------------------------------------ console helpers
@@ -103,71 +103,177 @@ def wait_enter(msg: str = "Press Enter when ready") -> None:
 
 # ------------------------------------------------------------------ step 1: Pi
 
+def ssh_candidates(args, cfg: dict) -> list[tuple[str, list[str], bool]]:
+    """Places to look for the Pi over SSH: (target, ssh options, trusted).
+    trusted = given or remembered, so a login is enough even without the log folder."""
+    if args.host:
+        t, o = parse_ssh_target(args.host)
+        return [(t, o, True)]
+    out = []
+    if cfg.get("host"):
+        out.append((cfg["host"], cfg.get("ssh_opts") or [], True))
+    conf = Path.home() / ".ssh" / "config"
+    try:
+        hosts, name_ok = [], False
+        for line in conf.read_text(encoding="utf-8", errors="replace").splitlines() + ["Host *"]:
+            k, _, v = line.strip().partition(" ")
+            if k.lower() == "host":
+                if name_ok:
+                    out += [(h, [], False) for h in hosts]
+                hosts = [h for h in v.split() if not any(c in h for c in "*?!")]
+                name_ok = any(re.search(r"pi|rasp", h, re.I) for h in hosts)
+            elif k.lower() == "hostname" and re.search(r"pi|rasp", v, re.I):
+                name_ok = True
+    except OSError:
+        pass
+    import getpass
+    for host in ("raspberrypi.local", "raspberrypi"):
+        for user in dict.fromkeys([getpass.getuser(), "pi"]):
+            out.append((f"{user}@{host}", [], False))
+    seen, uniq = set(), []
+    for c in out:
+        if c[0] not in seen:
+            seen.add(c[0])
+            uniq.append(c)
+    return uniq
+
+
+def ssh_problem(err: str) -> str:
+    """Plain-language reason for a failed SSH login."""
+    e = err.lower()
+    for key, why in [
+        ("could not resolve", "this name is not found on the network (wrong address, or not on the same network)"),
+        ("timed out", "no answer (Pi off, other network, or Tailscale not running)"),
+        ("no route to host", "no route to it (other network, or blocked by the router)"),
+        ("connection refused", "the Pi answers but SSH is off (enable SSH on the Pi)"),
+        ("host key verification failed", "the Pi's identity changed or is new (log in once with `ssh` to accept it)"),
+        ("permission denied", "the Pi wants a password or key (log in with a password below)"),
+    ]:
+        if key in e:
+            return why
+    return err.strip().splitlines()[-1] if err.strip() else "no answer"
+
+
+def find_pi_over_ssh(args, cfg: dict) -> tuple[tuple[str, list[str]] | None, dict[str, str]]:
+    """Log in silently (no password prompts) to the likely Pi addresses at once; pick the one
+    that has the log folder (or the one you gave / used last time).
+    Returns (found or None, {target: problem} for the ones that failed)."""
+    if not shutil.which("ssh"):
+        return None, {"ssh": "no `ssh` command on this laptop (Windows: Settings > System > Optional "
+                             "features > OpenSSH Client)"}
+    cands = ssh_candidates(args, cfg)
+    results: dict[str, str] = {}
+    problems: dict[str, str] = {}
+
+    def probe(target, opts):
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", *opts, target,
+                                f"test -d {DEFAULT_LOG_DIR} && echo VCM_DIR || echo VCM_NODIR"],
+                               capture_output=True, text=True, timeout=20)
+            results[target] = r.stdout.strip() if r.returncode == 0 else ""
+            if r.returncode != 0:
+                problems[target] = ssh_problem(r.stderr)
+        except (OSError, subprocess.SubprocessError) as e:
+            results[target] = ""
+            problems[target] = ssh_problem(str(e))
+
+    threads = [threading.Thread(target=probe, args=(t, o)) for t, o, _ in cands]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    for t, o, _ in cands:
+        if "VCM_DIR" in results.get(t, "").replace("VCM_NODIR", ""):
+            return (t, o), problems
+    for t, o, trusted in cands:
+        if trusted and results.get(t):
+            return (t, o), problems
+    for t, o, _ in cands:
+        if results.get(t):
+            problems[t] = f"logs in, but has no {DEFAULT_LOG_DIR} folder (not your Pi, or no log yet)"
+    return None, problems
+
+
 def setup_pi(args, cfg: dict, run_dir: Path):
     banner(1, "Your Raspberry Pi")
-    info("Your Pi should already be connected, with your assistant running and writing one line per\n"
-         f"command to its log file (default {DEFAULT_LOG}). See README > Before you start.")
-    mode = args.mode or cfg.get("mode") or "ssh"
+    info("Your Pi is already connected and your assistant is running, writing one line per command\n"
+         f"to {DEFAULT_LOG_DIR}/<id>_<date-time>.log (the newest log file there is read).\n"
+         "See README > Before you start.")
+    cfg["logs"] = args.log or []
+    cfg["log_cmds"] = args.log_cmd or []
+    cfg["log_dirs"] = [] if (cfg["logs"] or cfg["log_cmds"]) else (args.log_dir or [DEFAULT_LOG_DIR])
+    cfg["proc"] = args.proc or ""          # blank: the process that has the log file open
+    parser = LineParser(cfg.get("command_regex"), cfg.get("wake_regex"))
+
+    mode = args.mode or "auto"
+    password = False
+    if mode in ("auto", "ssh"):
+        info("Looking for your Pi ...")
+        found, problems = find_pi_over_ssh(args, cfg)
+        if found:
+            mode = "ssh"
+            target, extra = found
+            cfg["host"], cfg["ssh_opts"] = target, extra + (args.ssh_opt or [])
+        else:
+            info("Could not log in automatically. What went wrong:")
+            for t, why in problems.items():
+                info(f"  - {t}: {why}")
+            a = choose("How do you want to connect?", [
+                ("1", "log in with your Pi's username and password"),
+                ("2", "let the Pi send its data to this laptop (paste one command on the Pi)"),
+                ("q", "quit")], "1")
+            if a == "q":
+                raise SystemExit(0)
+            if a == "1":
+                raw = ask("How you log in to the Pi (user@host, or the whole ssh command)",
+                          args.host or cfg.get("host") or "pi@raspberrypi.local")
+                target, extra = parse_ssh_target(raw)
+                cfg["host"], cfg["ssh_opts"] = target, extra + (args.ssh_opt or [])
+                mode, password = "ssh", True
+            else:
+                mode = "http"
     cfg["mode"] = mode
 
-    if mode in ("ssh", "http"):
-        logs = args.log or cfg.get("logs") or []
-        log_cmds = args.log_cmd or cfg.get("log_cmds") or []
-        if not log_cmds:
-            a = ask("Log file on the Pi", (logs or [DEFAULT_LOG])[0])
-            if a.startswith("!"):                    # advanced: follow a command's output instead
-                logs, log_cmds = [], [a[1:].strip()]
-            else:
-                logs = [a]
-        cfg["logs"], cfg["log_cmds"] = logs, log_cmds
-        cfg["proc"] = args.proc or cfg.get("proc") or ""   # blank: the process that has the log open
-
-    parser = LineParser(cfg.get("command_regex"), cfg.get("wake_regex"))
     if mode == "ssh":
-        raw = args.host or ask("How you log in to the Pi (user@host, or the whole ssh command)",
-                               cfg.get("host") or "pi@raspberrypi.local")
-        target, extra = parse_ssh_target(raw)
-        cfg["host"] = target
-        if extra:
-            cfg["ssh_opts"] = extra
-        if not shutil.which("ssh"):
-            info("No `ssh` command found. Windows 10/11: Settings > System > Optional features >\n"
-                 "Add a feature > 'OpenSSH Client', then open a new terminal.")
-            raise SystemExit(1)
-        link = SshLink(parser, target, args.ssh_opt or cfg.get("ssh_opts") or [], CACHE / "ssh",
-                       cfg["logs"], cfg["log_cmds"], cfg["proc"] or None,
-                       python=cfg.get("pi_python", "python3"))
-        info(f"Connecting to {target} ...")
-        ok, out = link.check()
-        if not ok:
-            info(f"Could not log in to the Pi: {out}\n"
-                 f"Check that `ssh {target}` logs in from a terminal, then run this again.")
-            raise SystemExit(1)
+        target = cfg["host"]
+        link = SshLink(parser, target, cfg["ssh_opts"], CACHE / "ssh", cfg["logs"], cfg["log_cmds"],
+                       cfg["proc"] or None, python=cfg.get("pi_python", "python3"), log_dirs=cfg["log_dirs"])
+        if password:
+            info(f"Logging in to {target} (type the Pi's password when asked) ...")
+            ok, out = link.check()
+            if not ok:
+                info(f"Could not log in: {ssh_problem(out)}\n  ({out.strip()[-200:]})")
+                raise SystemExit(1)
+        else:
+            info(f"Found it: {target}")
         link.upload_agent()
         specs = link.fetch_specs()
-        for path in cfg["logs"]:
-            r = link.run(f"test -e {path if path.startswith('~/') else shlex.quote(path)} && echo yes", timeout=30)
-            if b"yes" not in r.stdout:
-                info(f"Note: {path} does not exist on the Pi yet. That's fine if your assistant creates it\n"
-                     "when it starts; otherwise point your assistant (or this script) at the right file.")
+        for d in cfg["log_dirs"]:
+            r = link.run(f"ls -t {d}/*.log 2>/dev/null | head -1", timeout=30)
+            newest = r.stdout.decode(errors="replace").strip()
+            info(f"Log: {newest or f'no log file in {d} yet (fine if your assistant creates one when it starts)'}")
     elif mode == "http":
-        port = int(args.port or cfg.get("port") or 8765)
-        cfg["port"] = port
-        link = HttpLink(parser, port)
+        link = HttpLink(parser, int(args.port or 8765))
         link.start()
-        ips = laptop_ips()
-        argv = " ".join(link.agent_args(cfg["logs"], [f"'{c}'" for c in cfg["log_cmds"]],
-                                        f"'{cfg['proc']}'" if cfg["proc"] else None, 1.0))
-        info("\nOn the Pi:\n"
-             "  1. Copy pi_agent.py from this repo to the Pi (git clone, scp, USB stick, ...).\n"
-             "  2. Run (keep it running during the test):\n")
-        for ip in ips or ["<LAPTOP_IP>"]:
-            info(f"     python3 pi_agent.py --post http://{ip}:{port} {argv}")
-        info("\n  Use the laptop IP that the Pi can reach (Tailscale IP if you use Tailscale).\n"
-             "  macOS may ask to allow incoming connections for Python: allow it.\n"
+        port = link.port
+        urls = ",".join(f"http://{ip}:{port}" for ip in laptop_ips()) or f"http://LAPTOP_IP:{port}"
+        argv = " ".join(shlex.quote(a) if not a.startswith("~/") else a
+                        for a in link.agent_args(cfg["logs"], cfg["log_cmds"], cfg["proc"] or None, 1.0,
+                                                 cfg["log_dirs"]))
+        info("\nThis laptop cannot log in to the Pi by itself, so let the Pi send its data here.\n"
+             "In a terminal on the Pi, paste this one line and leave it running:\n")
+        print(f"    curl -sL {AGENT_URL} | python3 - --post {urls} {argv}\n")
+        info("(No curl? use `wget -qO- URL | python3 - ...`; no internet on the Pi? copy pi_agent.py\n"
+             " from this folder to the Pi and run `python3 pi_agent.py --post ...` with the same options.)\n"
+             "macOS/Windows may ask to allow incoming connections for Python: allow it.\n"
              "Waiting for the Pi ...")
+        waited = time.time()
         while not link.specs:
             time.sleep(0.5)
+            if time.time() - waited > 45:
+                waited = time.time()
+                info("Still waiting. On the Pi, `curl " + urls.split(",")[0] + "/ping` should print 'ok'.\n"
+                     "If it doesn't, the Pi cannot reach this laptop: use the same Wi-Fi/hotspot or Tailscale.")
         specs = link.specs
         info("Pi connected.")
     elif mode == "manual":
@@ -201,7 +307,7 @@ def setup_pi(args, cfg: dict, run_dir: Path):
 
 def record_wake(args, cfg: dict, run_dir: Path) -> tuple[str, list]:
     banner(2, "Record your wake word")
-    word = args.wake_word or cfg.get("wake_word") or ask("Your wake word, as you say it", "Watson")
+    word = args.wake_word or cfg.get("wake_word") or ask("Your wake word, as you say it", "hey pi")
     cfg["wake_word"] = word
     wake_dir = run_dir / "wake"
     if args.wake_files:
@@ -783,7 +889,7 @@ def notify(title: str, msg: str) -> None:
 
 
 def parse_ssh_target(raw: str) -> tuple[str, list[str]]:
-    """'abnunez@1.2.3.4', 'ssh abnunez@1.2.3.4' or 'ssh -p 2222 pi@host' -> (target, extra ssh options)."""
+    """'pi@1.2.3.4', 'ssh pi@1.2.3.4' or 'ssh -p 2222 pi@host' -> (target, extra ssh options)."""
     parts = shlex.split(raw.strip(), posix=not IS_WINDOWS)
     if parts and parts[0].lower() in ("ssh", "ssh.exe"):
         parts = parts[1:]
@@ -913,11 +1019,14 @@ def cleanup(run_dir: Path, delete: bool) -> None:
 def main() -> None:
     global YES
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["ssh", "http", "manual", "sim"], help="how to reach the Pi")
+    ap.add_argument("--mode", choices=["auto", "ssh", "http", "manual", "sim"],
+                    help="how to reach the Pi (default auto: SSH if it logs in by itself, else the Pi sends)")
     ap.add_argument("--host", help="SSH target, e.g. pi@192.168.1.20 or an ~/.ssh/config alias")
     ap.add_argument("--ssh-opt", action="append", help="extra ssh option, e.g. --ssh-opt=-p2222")
     ap.add_argument("--port", type=int, help="laptop port for --mode http (default 8765)")
-    ap.add_argument("--log", action="append", help="log file on the Pi with your assistant's output")
+    ap.add_argument("--log-dir", action="append", help=f"folder on the Pi with your assistant's logs "
+                                                         f"(default {DEFAULT_LOG_DIR}; the newest .log is read)")
+    ap.add_argument("--log", action="append", help="one fixed log file on the Pi instead of the folder")
     ap.add_argument("--log-cmd", action="append", help="command on the Pi whose output to follow")
     ap.add_argument("--proc", help="regex for your assistant's process command line (CPU/RAM)")
     ap.add_argument("--student", help="your name or student number (goes in the report)")
@@ -1003,6 +1112,7 @@ def main() -> None:
     finally:
         link.stop()
     cfg["t_end"] = t_end
+    cfg["pi_log_file"] = getattr(link, "log_file", "") or ", ".join(cfg.get("logs") or [])
     save_cfg(cfg, run_dir)
 
     banner(6, "Results")
@@ -1011,7 +1121,7 @@ def main() -> None:
     if not samples and (run_dir / "pi_samples.jsonl").exists():
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
     meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
-                                     "seed", "pi_mic", "mic_check")}
+                                     "seed", "pi_mic", "mic_check", "pi_log_file")}
     meta["id_order"] = cfg.get("id_order")
     meta["id_orders"] = current_id_orders(cfg)
     meta["holdout"] = cfg.get("holdout") or "huggingface"
