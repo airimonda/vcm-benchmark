@@ -131,8 +131,7 @@ def ssh_candidates(args, cfg: dict) -> list[tuple[str, list[str], bool]]:
         kh = (Path.home() / ".ssh" / "known_hosts").read_text(encoding="utf-8", errors="replace")
     except OSError:
         kh = ""
-    import getpass
-    users = list(dict.fromkeys([getpass.getuser(), "pi"]))
+    users = ["pi"]          # generic default only; never the laptop's own (private) username
     for line in kh.splitlines():
         field = line.split(" ", 1)[0]
         for h in field.split(","):
@@ -142,8 +141,7 @@ def ssh_candidates(args, cfg: dict) -> list[tuple[str, list[str], bool]]:
             host, opts = (m.group(1), ["-p", m.group(2)]) if m else (h, [])
             out += [(f"{u}@{host}", opts, False) for u in users]
     for host in ("raspberrypi.local", "raspberrypi"):
-        for user in dict.fromkeys([getpass.getuser(), "pi"]):
-            out.append((f"{user}@{host}", [], False))
+        out.append((f"pi@{host}", [], False))
     seen, uniq = set(), []
     for c in out:
         if c[0] not in seen:
@@ -261,8 +259,11 @@ def setup_pi(args, cfg: dict, run_dir: Path):
             cfg["host"], cfg["ssh_opts"] = target, extra + (args.ssh_opt or [])
         else:
             info("Could not log in automatically. What went wrong:")
+            by_reason: dict[str, list[str]] = {}
             for t, why in problems.items():
-                info(f"  - {t}: {why}")
+                by_reason.setdefault(why, []).append(t)
+            for why, targets in by_reason.items():
+                info(f"  - {', '.join(targets)}: {why}")
             a = choose("How do you want to connect?", [
                 ("1", "log in with your Pi's username and password"),
                 ("2", "let the Pi send its data to this laptop (paste one command on the Pi)"),
@@ -1229,7 +1230,8 @@ def main() -> None:
     finally:
         link.stop()
     cfg["t_end"] = t_end
-    cfg["pi_log_file"] = getattr(link, "log_file", "") or ", ".join(cfg.get("logs") or [])
+    cfg["pi_log_file"] = re.sub(r"^/(?:home|Users)/[^/]+/", "~/",
+                                getattr(link, "log_file", "") or ", ".join(cfg.get("logs") or []))
     save_cfg(cfg, run_dir)
 
     banner(6, "Results")
@@ -1237,7 +1239,7 @@ def main() -> None:
     samples = link.samples
     if not samples and (run_dir / "pi_samples.jsonl").exists():
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
-    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
+    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "wake_word", "wake_gap", "size",
                                      "seed", "pi_mic", "mic_check", "pi_log_file")}
     meta["id_order"] = cfg.get("id_order")
     meta["id_orders"] = current_id_orders(cfg)
@@ -1266,7 +1268,7 @@ def rescore(args) -> None:
     samples = [json.loads(l) for l in sp.read_text(encoding="utf-8").splitlines() if l] if sp.exists() else []
     specs_p = run_dir / "pi_specs.json"
     specs = json.loads(specs_p.read_text(encoding="utf-8")) if specs_p.exists() else {}
-    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
+    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "wake_word", "wake_gap", "size",
                                      "seed", "pi_mic", "mic_check", "id_order")}
     meta["id_orders"] = current_id_orders(cfg)
     meta["holdout"] = cfg.get("holdout") or "huggingface"

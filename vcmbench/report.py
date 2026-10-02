@@ -130,7 +130,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         pi["effective_gflops_per_s"] = model_profile["flops"] / (pi["infer_ms"]["mean"] / 1000) / 1e9
     return {
         "meta": meta,
-        "pi_specs": {k: v for k, v in specs.items() if k not in ("type", "t")},
+        "pi_specs": {k: v for k, v in specs.items() if k not in ("type", "t", "hostname")},  # no private names
         "model": model_profile,
         "intent_level": M.classification_report(yt_i, yp_i),
         "command_level": M.classification_report(yt_c, yp_c),
@@ -344,7 +344,7 @@ def render_markdown(m: dict) -> str:
     out += ["## Raspberry Pi", ""]
     s = m["pi_specs"]
     pk = s.get("packages") or {}
-    out += [f"- **{s.get('model') or '?'}** ({s.get('hostname')}), {s.get('cores')} cores "
+    out += [f"- **{s.get('model') or '?'}**, {s.get('cores')} cores "
             f"{s.get('cpu_model') or ''} up to {s.get('max_freq_mhz')} MHz, RAM {s.get('ram_mb')} MB, "
             f"{s.get('os')}, kernel {s.get('kernel')}, Python {s.get('python')}",
             "- packages: " + (", ".join(f"{k} {v}" for k, v in pk.items() if v) or "-"), ""]
