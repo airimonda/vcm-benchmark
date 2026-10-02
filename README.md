@@ -50,9 +50,34 @@ On the Pi you need nothing extra: `pi_agent.py` uses only the Python standard li
 | SSH client | built in | built in on Windows 10/11; if `ssh` is missing: Settings > System > Optional features > OpenSSH Client |
 | Password-less SSH (needed for unattended reconnects) | `ssh-keygen -t ed25519`, then `ssh-copy-id user@pi` | `ssh-keygen -t ed25519`, then `type $env:USERPROFILE\.ssh\id_ed25519.pub \| ssh user@pi "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"` |
 | SSH password prompts | asked once per run (shared connection) | asked at each step (Windows ssh has no shared connection), so set up the key |
-| Connection 2 (Pi to laptop) | allow incoming connections for Python when asked | allow Python in the Windows Defender Firewall prompt (Private networks) |
+| `--mode http` (Pi to laptop) | allow incoming connections for Python when asked | allow Python in the Windows Defender Firewall prompt (Private networks) |
 | Kept awake during the run | `caffeinate` | Windows power request (no setting needed); still keep it plugged in |
 | Done notification | Notification Center | tray balloon |
+
+## Before you start
+
+Before you run the benchmark:
+
+1. **Your Pi is already connected** to this laptop (however you connected it) and you can log in
+   with `ssh user@host`, e.g. `ssh abnunez@100.75.251.43`, without typing a password.
+
+2. **Your assistant appends one line per command to `~/vcm_benchmark.log` on the Pi** (the
+   default; another path works too, the script asks). Format: see
+   [What your Pi must print](#what-your-pi-must-print). Minimal version:
+
+   ```python
+   import json, os
+   log = open(os.path.expanduser("~/vcm_benchmark.log"), "a", buffering=1)
+   # after each decision:
+   print(json.dumps({"intent": intent, "slot": slot, "infer_ms": infer_ms, "audio_ms": audio_ms}),
+         file=log, flush=True)
+   ```
+
+3. **Your assistant is running** on the Pi, and the laptop speaker is about 1 m from the Pi's mic.
+
+The script then asks only two things about the Pi: how you log in (`user@host`, or paste the whole
+`ssh ...` command) and the log file (Enter for the default). It finds your assistant's process by
+itself (the process that has the log file open) to report its CPU and RAM.
 
 ## Run
 
@@ -64,7 +89,8 @@ python benchmark.py --mode sim --no-audio --size quick --limit 10 --gap-min 1 --
 
 The script walks you through these steps:
 
-1. **Connect to your Pi** and read its specs (model, CPU, RAM, OS, Python packages, microphones).
+1. **Your Pi**: log in over SSH and read its specs (model, CPU, RAM, OS, Python packages,
+   microphones).
 2. **Record your wake word** 3 times on the laptop microphone (or `--wake-files a.wav b.wav`).
 3. **Build the test audio**: each holdout clip gets one of your wake word takes in front of it,
    with a pause in between (default 0.8 s; set it to what your Pi needs after its chime).
@@ -112,23 +138,25 @@ local copy.
 Your answers are saved in `bench_settings.json`, so the next run asks fewer questions
 (`--fresh` to start over). Interrupted? `python benchmark.py --resume runs/<run-id>`.
 
-## Connect your Pi however you like
+## Other ways to connect (advanced)
 
-| Option | Use when | What you give |
-|---|---|---|
-| **1. SSH** (recommended) | The laptop can `ssh` to the Pi: same Wi-Fi/LAN, `raspberrypi.local`, Tailscale, USB-ethernet gadget, hotspot | `user@host` or an `~/.ssh/config` alias |
-| **2. Pi to laptop (HTTP)** | The laptop cannot reach the Pi (e.g. router client isolation), but the Pi can reach the laptop | Run the printed `python3 pi_agent.py --post http://LAPTOP_IP:8765 ...` on the Pi |
-| **3. Manual** | No network at all | After each command you type what the Pi did (`14 30 seconds`, `TIMER 30 seconds`, Enter = nothing) |
-| **4. Simulation** | No Pi; just trying the script | nothing |
+The guide assumes SSH (see [Before you start](#before-you-start)). If SSH is impossible:
 
-For SSH, the script copies `pi_agent.py` to `~/.vcm_bench/` on the Pi and runs it there. One SSH
-connection is shared, so you type a password at most once (`ssh-copy-id user@host` avoids it).
-Extra ssh options: `--ssh-opt=-p2222 --ssh-opt=-i~/.ssh/mykey`.
+| Flag | Use when |
+|---|---|
+| `--mode http` | the laptop cannot reach the Pi but the Pi can reach the laptop: run the printed `python3 pi_agent.py --post http://LAPTOP_IP:8765 ...` on the Pi |
+| `--mode manual` | no network at all: after each command you type what the Pi did (`TIMER 30 seconds`, Enter = nothing) |
+| `--mode sim` | no Pi, to try the script |
+
+Other options: `--host user@host`, `--log PATH`, `--log-cmd "journalctl --user -u myassistant -f -n 0 -o cat"`
+(follow a command's output instead of a file; or type `!` + the command at the log question),
+`--proc REGEX` (pick the process to measure yourself), `--ssh-opt=-p2222`.
+For SSH, the script copies `pi_agent.py` to `~/.vcm_bench/` on the Pi and runs it there.
 
 ## What your Pi must print
 
-Your assistant must write **one line per recognised command** to a log file (or to a systemd
-journal / any command output you can follow). Every line must carry **what your model decided**
+Your assistant must append **one line per recognised command** to a log file on the Pi
+(default `~/vcm_benchmark.log`). Every line must carry **what your model decided**
 (either intent + slot, or one of the 93 command phrases, see below) and two timing fields:
 
 | Field | Meaning | Required |
@@ -148,12 +176,13 @@ intent=TIMER slot=30 seconds infer_ms=85 audio_ms=1500
 Python example for your runtime:
 
 ```python
-import json, time
+import json, os, time
 
 t0 = time.perf_counter()
 intent, slot = model.predict(audio)            # your features + model
 infer_ms = (time.perf_counter() - t0) * 1000
 audio_ms = len(audio) / sample_rate * 1000
+log = open(os.path.expanduser("~/vcm_benchmark.log"), "a", buffering=1)   # open once at start
 print(json.dumps({"intent": intent, "slot": slot,
                   "infer_ms": round(infer_ms, 1), "audio_ms": round(audio_ms)}), file=log, flush=True)
 ```
@@ -219,8 +248,9 @@ as missing).
   groups `intent`, `slot`, `infer_ms`, `audio_ms`, e.g.
   `RESULT: (?P<intent>\w+) \((?P<slot>[^)]*)\) (?P<infer_ms>[0-9.]+)ms/(?P<audio_ms>[0-9.]+)ms`.
 
-Tell the script how to find your process (e.g. `main.py`) to get **its** CPU and RAM, not just the
-whole Pi's.
+The script measures **your assistant's** CPU and RAM by finding the process that has the log
+file open. If your assistant opens the file only briefly per line, pass `--proc main.py` (a
+pattern from its command line) instead.
 
 ## What the report contains
 

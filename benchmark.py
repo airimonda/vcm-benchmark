@@ -25,6 +25,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,7 +52,8 @@ for _stream in (sys.stdout, sys.stderr):        # Pi log lines may hold characte
         pass
 
 ID_ORDER: list[str] | None = None   # class-number order for models that print a number (see schema.ID_ORDER_HELP)
-SAVED_SETTINGS = ROOT / "bench_settings.json"     # remembered answers (git-ignored)
+SAVED_SETTINGS = ROOT / "bench_settings.json"
+DEFAULT_LOG = "~/vcm_benchmark.log"   # where the assistant on the Pi appends one line per command     # remembered answers (git-ignored)
 CACHE = ROOT / ".cache"
 
 # ------------------------------------------------------------------ console helpers
@@ -102,68 +104,52 @@ def wait_enter(msg: str = "Press Enter when ready") -> None:
 # ------------------------------------------------------------------ step 1: Pi
 
 def setup_pi(args, cfg: dict, run_dir: Path):
-    banner(1, "Connect to your Raspberry Pi")
-    info("Your Pi runs YOUR voice assistant as usual. This laptop plays the commands out loud,\n"
-         "and reads what your assistant printed (its log) plus CPU/temperature/RAM from the Pi.\n"
-         "Tip: run your assistant in a quiet/mock mode (no music playing, short replies),\n"
-         "because the Pi's own speaker can drown out the next command.")
-    mode = args.mode or cfg.get("mode")
-    if not mode:
-        mode = {"1": "ssh", "2": "http", "3": "manual", "4": "sim"}[choose("Connection", [
-            ("1", "SSH from this laptop (Wi-Fi/LAN IP, raspberrypi.local, Tailscale, USB cable, ...)"),
-            ("2", "Pi sends to this laptop (use when the laptop cannot reach the Pi)"),
-            ("3", "Manual: no connection, I type what the Pi did after each command"),
-            ("4", "Simulation: no Pi, just try the pipeline"),
-        ], "1")]
+    banner(1, "Your Raspberry Pi")
+    info("Your Pi should already be connected, with your assistant running and writing one line per\n"
+         f"command to its log file (default {DEFAULT_LOG}). See README > Before you start.")
+    mode = args.mode or cfg.get("mode") or "ssh"
     cfg["mode"] = mode
 
     if mode in ("ssh", "http"):
-        info("\nWhere does your assistant print its result? Give the log file(s) on the Pi,\n"
-             "e.g. ~/myassistant/logs/live.log, or a command whose output to follow,\n"
-             "e.g. `journalctl --user -u myassistant -f -n 0 -o cat` (systemd service).\n"
-             "Each recognised command must appear as ONE line, for example:\n"
-             '   {"intent": "TIMER", "slot": "30 seconds", "infer_ms": 85}\n'
-             "   intent=TIMER slot=30 seconds\n"
-             "Optional: a line containing 'wake word' when the wake word fires (gives wake-rate).\n"
-             "See README.md > 'What your Pi must print'.")
         logs = args.log or cfg.get("logs") or []
         log_cmds = args.log_cmd or cfg.get("log_cmds") or []
-        if not logs and not log_cmds:
-            a = ask("Log file on the Pi (or start with '!' for a command)", "")
-            if a.startswith("!"):
-                log_cmds = [a[1:].strip()]
-            elif a:
+        if not log_cmds:
+            a = ask("Log file on the Pi", (logs or [DEFAULT_LOG])[0])
+            if a.startswith("!"):                    # advanced: follow a command's output instead
+                logs, log_cmds = [], [a[1:].strip()]
+            else:
                 logs = [a]
         cfg["logs"], cfg["log_cmds"] = logs, log_cmds
-        if not logs and not log_cmds:
-            info("No log given: the Pi's answers cannot be read. Switching to manual entry,\n"
-                 "but Pi metrics are still collected.")
-            cfg["manual_answers"] = True
-        cfg["proc"] = args.proc or cfg.get("proc") or ask(
-            "Text that identifies your assistant's process (e.g. 'main.py' or 'python.*assistant';"
-            " blank = whole Pi only)", "")
+        cfg["proc"] = args.proc or cfg.get("proc") or ""   # blank: the process that has the log open
 
     parser = LineParser(cfg.get("command_regex"), cfg.get("wake_regex"))
     if mode == "ssh":
-        target = args.host or cfg.get("host") or ask("SSH target (user@host or ~/.ssh/config alias)",
-                                                     "pi@raspberrypi.local")
+        raw = args.host or ask("How you log in to the Pi (user@host, or the whole ssh command)",
+                               cfg.get("host") or "pi@raspberrypi.local")
+        target, extra = parse_ssh_target(raw)
         cfg["host"] = target
+        if extra:
+            cfg["ssh_opts"] = extra
         if not shutil.which("ssh"):
             info("No `ssh` command found. Windows 10/11: Settings > System > Optional features >\n"
-                 "Add a feature > 'OpenSSH Client', then open a new terminal. Or use connection 2 or 3.")
+                 "Add a feature > 'OpenSSH Client', then open a new terminal.")
             raise SystemExit(1)
         link = SshLink(parser, target, args.ssh_opt or cfg.get("ssh_opts") or [], CACHE / "ssh",
                        cfg["logs"], cfg["log_cmds"], cfg["proc"] or None,
                        python=cfg.get("pi_python", "python3"))
-        info(f"Connecting to {target} (type the Pi password if asked) ...")
+        info(f"Connecting to {target} ...")
         ok, out = link.check()
         if not ok:
-            info(f"SSH failed: {out}\n"
-                 "Check: Pi on, same network (or Tailscale up), `ssh {target}` works in a terminal.\n"
-                 + key_tip(target))
+            info(f"Could not log in to the Pi: {out}\n"
+                 f"Check that `ssh {target}` logs in from a terminal, then run this again.")
             raise SystemExit(1)
         link.upload_agent()
         specs = link.fetch_specs()
+        for path in cfg["logs"]:
+            r = link.run(f"test -e {path if path.startswith('~/') else shlex.quote(path)} && echo yes", timeout=30)
+            if b"yes" not in r.stdout:
+                info(f"Note: {path} does not exist on the Pi yet. That's fine if your assistant creates it\n"
+                     "when it starts; otherwise point your assistant (or this script) at the right file.")
     elif mode == "http":
         port = int(args.port or cfg.get("port") or 8765)
         cfg["port"] = port
@@ -794,6 +780,27 @@ def notify(title: str, msg: str) -> None:
             subprocess.run(["notify-send", title, msg], timeout=5, capture_output=True)
     except Exception:
         pass
+
+
+def parse_ssh_target(raw: str) -> tuple[str, list[str]]:
+    """'abnunez@1.2.3.4', 'ssh abnunez@1.2.3.4' or 'ssh -p 2222 pi@host' -> (target, extra ssh options)."""
+    parts = shlex.split(raw.strip(), posix=not IS_WINDOWS)
+    if parts and parts[0].lower() in ("ssh", "ssh.exe"):
+        parts = parts[1:]
+    with_value = set("bcDEeFIiJLlmOoPpQRSWw")       # ssh options that take a value
+    target, opts, i = "", [], 0
+    while i < len(parts):
+        x = parts[i]
+        if x.startswith("-") and len(x) == 2 and x[1] in with_value and i + 1 < len(parts):
+            opts += [x, parts[i + 1]]
+            i += 2
+            continue
+        if x.startswith("-"):
+            opts.append(x)
+        elif not target:
+            target = x
+        i += 1
+    return target, opts
 
 
 def key_tip(target: str | None) -> str:
