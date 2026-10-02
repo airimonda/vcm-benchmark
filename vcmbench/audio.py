@@ -195,3 +195,31 @@ class Player:
         stream.stop()      # waits until the buffered audio has played
         stream.close()
         return t0
+
+
+def mic_levels(ambient: np.ndarray, recording: np.ndarray, sr: int = SR) -> dict:
+    """How well the Pi's microphone hears the laptop.
+
+    ambient: the room with nothing playing; recording: the room while the laptop
+    plays a command. Speech level = the loudest 10% of 20 ms frames of the
+    recording; noise = RMS of the ambient take. Verdict: "ok", "weak",
+    "not heard" (signal-to-noise ratio) or "clipping".
+    """
+    hop = int(0.02 * sr)
+    e = _frame_db(recording, hop) if len(recording) >= 2 * hop else np.array([-120.0])
+    loud = np.sort(e)[-max(1, len(e) // 10):]
+    speech = float(10 * np.log10(np.mean(10 ** (loud / 10))))
+    noise = dbfs(ambient - ambient.mean()) if len(ambient) else -120.0
+    peak = float(np.abs(recording).max()) if len(recording) else 0.0
+    clip = float(np.mean(np.abs(recording) >= 0.99)) if len(recording) else 0.0
+    snr = speech - noise
+    if clip > 0.001 or peak >= 0.999:
+        verdict = "clipping"
+    elif snr < 10 or speech < -50:
+        verdict = "not heard"
+    elif snr < 20 or speech < -40:
+        verdict = "weak"
+    else:
+        verdict = "ok"
+    return {"speech_dbfs": speech, "noise_dbfs": noise, "snr_db": snr, "peak": peak,
+            "clipped_fraction": clip, "verdict": verdict}

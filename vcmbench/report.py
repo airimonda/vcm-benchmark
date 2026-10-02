@@ -282,6 +282,10 @@ def render_markdown(m: dict) -> str:
     out += [f"Wake word: **{meta.get('wake_word')}** - trials: {m['pipeline']['trials']} with the wake word + "
             f"{m['false_wake']['n']} without - shuffle seed: {meta.get('seed')} - "
             f"connection: {meta.get('mode')} - holdout: {meta.get('holdout')}", ""]
+    mc = meta.get("mic_check")
+    if mc:
+        out += [f"Mic check (Pi input {meta.get('pi_mic')}): signal-to-noise {mc['snr_db']} dB, laptop speech "
+                f"{mc['speech_dbfs']} dBFS, room noise {mc['noise_dbfs']} dBFS - {mc['verdict']}", ""]
 
     out += render_glance(m)
     out += ["# Detailed metrics", "", "## Classification", ""]
