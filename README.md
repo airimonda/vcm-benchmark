@@ -177,10 +177,21 @@ whole Pi's.
 command: expected, what fired, raw log line, latency), `pi_metrics.csv` (one row per second),
 `pi_specs.json`, `config.json`.
 
+The report starts with **At a glance**: one small table with the key numbers for **overall**,
+**real voice** and **synthetic voice** (intent and command accuracy, false accept, false reject,
+false wake, slot exact match, latency p95), one line of Pi numbers (real-time factor, inference
+time, max temperature, CPU and RAM of your assistant), and automatic warnings (unknown intent
+names, missing timing fields, throttling, low response rate, extra fires). The **detailed
+metrics** follow.
+
+**Overall vs real vs synthetic voices**: every metric below at both label levels, per group. The
+holdout's 10 out-of-scope clips are all real recordings, so synthetic voices have no false accept
+rate ("-").
+
 **Classification**, at the 19-intent level and at the 93-command level:
 accuracy (with 95% Wilson interval), balanced accuracy, macro precision / recall / F1 / F2,
 false accept rate, false reject rate, misfire rate, the most frequent confusions, per-intent
-scores, and the split between real and synthetic voices.
+scores.
 
 * REJECT = the clip was out of scope; on the prediction side it means the Pi said out of
   scope or did not respond.

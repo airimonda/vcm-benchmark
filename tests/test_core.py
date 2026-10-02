@@ -308,3 +308,24 @@ def test_sound_check_requires_timing(tmp_path, monkeypatch, pi_cls, waived):
     B.sound_check(argparse.Namespace(no_audio=True), cfg, link, None, tmp_path, trials,
                   S.build_alias_table())
     assert cfg["timing_waived"] is waived
+
+
+def test_breakdowns_overall_real_synthetic():
+    trials = [
+        _trial("TIME", "Time", "", "TIME", ""),
+        _trial("TIME", "Time", "", "PAUSE", ""),
+        _trial("TIMER", "Timer 1 minute", "1 minute", "TIMER", "60 seconds", is_synthetic=True),
+        _trial("OUT_OF_SCOPE", "", "", "STOP", ""),
+        _trial("PAUSE", "Pause", "", "PAUSE", "", kind="no_wake", is_synthetic=True),
+    ]
+    m = score(trials, [], {}, None, 0, 10, {})
+    b = m["breakdowns"]
+    assert list(b) == ["overall", "real voice", "synthetic voice"]
+    assert b["overall"]["n"] == 4 and b["overall"]["accuracy"] == pytest.approx(2 / 4)
+    assert b["real voice"]["n"] == 3 and b["real voice"]["accuracy"] == pytest.approx(1 / 3)
+    assert b["real voice"]["false_accept_rate"] == 1.0
+    assert b["synthetic voice"]["accuracy"] == 1.0 and b["synthetic voice"]["slot_exact_rate"] == 1.0
+    assert b["synthetic voice"]["false_wakes"] == 1 and b["overall"]["false_wakes"] == 1
+    md = render_markdown(m)
+    assert "Overall vs real vs synthetic" in md and "synthetic voice" in md
+    assert md.index("## At a glance") < md.index("# Detailed metrics") < md.index("## Classification")
