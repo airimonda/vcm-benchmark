@@ -187,7 +187,7 @@ def setup_pi(args, cfg: dict, run_dir: Path):
                  "ram_mb": ask("RAM in MB", ""), "os": ask("OS", ""), "hostname": "manual"}
         link.specs = specs
     else:
-        link = SimLink(parser, seed=args.seed)
+        link = SimLink(parser, seed=args.seed or 0)
         specs = link.specs
     if mode == "manual" or cfg.get("manual_answers"):
         link.manual = True
@@ -265,7 +265,7 @@ def record_wake(args, cfg: dict, run_dir: Path) -> tuple[str, list]:
 
 def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
     banner(3, "Build the test audio (wake word + command)")
-    clips = load_holdout(args.holdout or cfg.get("holdout"), CACHE)
+    clips = all_clips = load_holdout(args.holdout or cfg.get("holdout"), CACHE)
     info(f"Holdout set: {len(clips)} clips ({sum(c.intent != S.OOS for c in clips)} commands over "
          f"{len({c.variation for c in clips if c.variation})} variations, "
          f"{sum(c.intent == S.OOS for c in clips)} out-of-scope).")
@@ -278,7 +278,8 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
             ("2", f"quick: 1 clip per variation + all out-of-scope ({93 + oos} clips, ~{est(93 + oos):.0f} min)"),
         ], "1"))
     cfg["size"] = size
-    rng = random.Random(args.seed)
+    seed = choose_seed(args, cfg)
+    rng = random.Random(seed)
     if size == "quick":
         seen, pick = set(), []
         for c in sorted(clips, key=lambda c: rng.random()):
@@ -286,8 +287,21 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
                 pick.append(c)
                 seen.add(c.variation)
         clips = pick
-    order = clips[:]
-    rng.shuffle(order)
+    # False-wake check: in-scope commands played WITHOUT the wake word, as many as the
+    # out-of-scope clips. The Pi should stay asleep. One clip per intent where possible.
+    n_fw = sum(c.intent == S.OOS for c in clips)
+    pool = [c for c in all_clips if c.intent != S.OOS]
+    rng.shuffle(pool)
+    no_wake, used = [], set()
+    for c in pool + pool:                       # second pass fills up if intents run out
+        if len(no_wake) == n_fw:
+            break
+        if c.intent not in used or len(used) == len(S.INTENTS):
+            if not any(c is d for d in no_wake):
+                no_wake.append(c)
+                used.add(c.intent)
+    order = [(c, "wake") for c in clips] + [(c, "no_wake") for c in no_wake]
+    rng.shuffle(order)                          # wake and no-wake trials mixed at random
     if args.limit:
         order = order[: args.limit]
 
@@ -297,19 +311,47 @@ def build_trials(args, cfg: dict, run_dir: Path, takes: list) -> list[dict]:
     cfg["wake_gap"] = gap
     out_dir = run_dir / "audio"
     trials = []
-    for k, c in enumerate(order):
+    wake_n = 0
+    for k, (c, kind) in enumerate(order):
         cmd = A.normalize(A.trim(c.audio))
-        wi = k % len(takes)
-        x, off = A.patch(takes[wi], cmd, gap)
+        if kind == "wake":
+            wi = wake_n % len(takes)
+            wake_n += 1
+            x, off = A.patch(takes[wi], cmd, gap)
+        else:
+            wi = -1
+            x, off = A.patch(A.np.zeros(0, dtype="float32"), cmd, 0.0)
         path = out_dir / f"trial_{k:03d}.wav"
         A.save(path, x)
-        trials.append({"order": k, "clip_idx": c.idx, "transcript": c.transcript,
+        trials.append({"order": k, "kind": kind, "clip_idx": c.idx, "transcript": c.transcript,
                        "true_intent": c.intent, "true_variation": c.variation, "true_slot": c.slot_value,
                        "speaker_id": c.speaker_id, "is_synthetic": c.is_synthetic,
                        "wake_take": wi + 1, "audio_file": path.relative_to(run_dir).as_posix(), **off})
     (run_dir / "plan.json").write_text(json.dumps(trials, indent=2), encoding="utf-8")
-    info(f"Wrote {len(trials)} trial files to {out_dir}")
+    nw = sum(t["kind"] == "no_wake" for t in trials)
+    info(f"Wrote {len(trials)} trial files to {out_dir}: {len(trials) - nw} with the wake word, "
+         f"{nw} without it (false-wake check), shuffled with seed {seed}.")
     return trials
+
+
+def choose_seed(args, cfg: dict) -> int:
+    """The shuffle seed decides the playing order and which clips are used for the
+    false-wake check. Same seed + same test size = same test."""
+    if args.seed is not None:
+        seed = args.seed
+    else:
+        suggestion = random.randint(1, 99999)
+        info("Shuffle seed: decides the order of the commands and which ones play without the\n"
+             "wake word. Keep the suggested random number, or type your own (e.g. the class's\n"
+             "agreed seed, or an earlier run's seed to repeat it exactly).")
+        while True:
+            a = ask("Shuffle seed", str(suggestion))
+            if a.lstrip("-").isdigit():
+                seed = int(a)
+                break
+            info("Please type a whole number.")
+    cfg["seed"] = seed
+    return seed
 
 
 # ------------------------------------------------------------------ step 4/5: play and collect
@@ -357,7 +399,7 @@ def play_trial(t: dict, player: A.Player | None, link, run_dir: Path) -> float:
     t["play_t0"] = t0
     t["cmd_end_abs"] = t0 + t["cmd_end"]
     if isinstance(link, SimLink):
-        link.respond(t["true_intent"], t["true_slot"], t["cmd_end_abs"])
+        link.respond(t["true_intent"], t["true_slot"], t["cmd_end_abs"], t.get("kind", "wake") == "wake")
     return t0
 
 
@@ -405,11 +447,13 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
     info("Place the laptop speaker about 1 m from the Pi's microphone. Set the laptop volume\n"
          "to a normal speaking level. Start your assistant on the Pi now if it is not running.\n"
          "Two warm-up commands play now; they are NOT scored.")
-    warm = [dict(t) for t in trials if t["true_intent"] in ("TIME", "TEMPERATURE")][:2] or [dict(trials[0])]
+    wake_trials = [t for t in trials if t.get("kind", "wake") == "wake"]
+    warm = [dict(t) for t in wake_trials if t["true_intent"] in ("TIME", "TEMPERATURE")][:2] or [dict(wake_trials[0])]
     while True:
         if not YES:
             wait_enter("Press Enter to play the warm-up commands")
         pool: list = []
+        timing_ok = True
         for t in warm:
             info(f"Playing: '{cfg['wake_word']}' ... '{t['transcript']}'  (expect {t['true_intent']} "
                  f"{t['true_slot']})".rstrip())
@@ -423,19 +467,38 @@ def sound_check(args, cfg: dict, link, player, run_dir: Path, trials: list[dict]
                     info(f"    | {line[:120]}")
             got = f"{t['pred_intent']} {t['pred_slot']}".strip()
             info(f"  -> understood as: {got}" + ("  (OK)" if t["pred_intent"] == t["true_intent"] else ""))
+            if t["n_command_events"] and not link.manual:
+                missing = [k for k in ("infer_ms", "audio_ms") if t.get(k) is None]
+                if missing:
+                    timing_ok = False
+                    info(f"  !! The line has no {' / '.join(missing)}. Both are REQUIRED on every command line:\n"
+                         "     infer_ms = time your model took for this command (features + model), in ms\n"
+                         "     audio_ms = length of the audio it processed, in ms\n"
+                         '     e.g. {"intent": "TIME", "slot": "", "infer_ms": 85, "audio_ms": 1500}\n'
+                         "     See README.md > 'What your Pi must print'. Add them and replay.")
+                else:
+                    info(f"  timing: infer_ms {t['infer_ms']:.0f}, audio_ms {t['audio_ms']:.0f} "
+                         f"(real-time factor {t['infer_ms'] / t['audio_ms']:.3f})" if t["audio_ms"] else
+                         "  !! audio_ms is 0")
             if t["pred_intent"].startswith("OTHER:"):
                 info(f"  '{t['pred_intent'][6:]}' is not one of the 19 intents. Add an alias, e.g. in "
                      f"bench_settings.json: \"aliases\": {{\"{t['pred_intent'][6:]}\": \"TIMER\"}}")
-        a = choose("Next", [("c", "continue to the test"), ("r", "replay (after changing the volume / position)"),
-                            ("x", "my Pi printed a line but it was not understood: enter a regex"),
-                            ("q", "quit")], "c")
-        if a == "c":
+        options = [("c", "continue to the test")] if timing_ok else []
+        options += [("r", "replay (after changing the volume / position / your Pi's output)"),
+                    ("x", "my Pi printed a line but it was not understood: enter a regex"),
+                    ("q", "quit")]
+        if not timing_ok:
+            options.append(("i", "continue WITHOUT infer_ms/audio_ms (report marks timing as missing)"))
+        a = choose("Next", options, "c" if timing_ok else ("i" if YES else "r"))
+        if a in ("c", "i"):
+            cfg["timing_waived"] = a == "i"
             return
         if a == "q":
             raise SystemExit(0)
         if a == "x":
-            info("Python regex with named groups: (?P<intent>...) required, (?P<slot>...),"
-                 " (?P<infer_ms>...) optional.\n  Example: RESULT: (?P<intent>\\w+) \\((?P<slot>[^)]*)\\)")
+            info("Python regex with named groups: (?P<intent>...), (?P<infer_ms>...), (?P<audio_ms>...) "
+                 "required, (?P<slot>...) for slots.\n"
+                 "  Example: RESULT: (?P<intent>\\w+) \\((?P<slot>[^)]*)\\) (?P<infer_ms>[0-9.]+)ms/(?P<audio_ms>[0-9.]+)ms")
             rx = ask("command regex", cfg.get("command_regex") or "")
             if rx:
                 cfg["command_regex"] = rx
@@ -456,7 +519,7 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
     finish = dt.datetime.now() + dt.timedelta(minutes=est)
     info(f"{len(todo)} trials to play (~{est:.0f} min, done around {finish:%H:%M}). {len(done)} already done.\n"
          "Running unattended now. Ctrl+C pauses (resume / skip / stop and score).")
-    rng = random.Random(args.seed + 1)
+    rng = random.Random(int(cfg.get("seed") or 0) + 1)
     t_start = cfg.get("t_start") or time.time()
     cfg["t_start"] = t_start
     pool: list = []
@@ -486,11 +549,17 @@ def run_trials(args, cfg: dict, link, player, run_dir: Path, trials: list[dict],
                 if a == "s":
                     i += 1
                 continue
-            ok = "OK " if t["pred_intent"] == t["true_intent"] or (
-                t["true_intent"] == S.OOS and t["pred_intent"] in (S.OOS, S.NONE)) else "-- "
             lat = f"{t['latency_s']:.2f}s" if t.get("latency_s") is not None else ""
+            if t.get("kind") == "no_wake":
+                ok = "OK " if t["n_command_events"] == 0 else "-- "
+                expected = "(no wake word) nothing"
+                got = "nothing" if t["n_command_events"] == 0 else f"FALSE WAKE: {t['pred_intent']}"
+            else:
+                ok = "OK " if t["pred_intent"] == t["true_intent"] or (
+                    t["true_intent"] == S.OOS and t["pred_intent"] in (S.OOS, S.NONE)) else "-- "
+                expected, got = t["true_intent"], f"{t['pred_intent']} {t['pred_slot']} {lat}"
             print(f"  {ok}[{len(done) + i + 1:3d}/{len(trials)}] '{t['transcript'][:38]:38s}' "
-                  f"expected {t['true_intent']:15s} got {t['pred_intent']} {t['pred_slot']} {lat}")
+                  f"expected {expected:22s} got {got}")
             if isinstance(link, SshLink) and (len(done) + i) % 20 == 19:
                 link.sync_clock(4)
             f.write(json.dumps(t, default=str) + "\n")
@@ -620,6 +689,8 @@ def approve(args, cfg: dict, link, trials: list[dict], run_dir: Path) -> dict | 
          f"  Pi            {link.specs.get('model') or '?'} ({cfg['mode']}"
          f"{', ' + cfg['host'] if cfg.get('host') else ''})\n"
          f"  wake word     '{cfg['wake_word']}', pause {cfg['wake_gap']} s before the command\n"
+         f"  shuffle seed  {cfg.get('seed')}  ({sum(t.get('kind') == 'no_wake' for t in trials)} commands "
+         f"play without the wake word)\n"
          f"  commands      {n} ({cfg.get('size')}), {args.gap_min:g}-{args.gap_max:g} s apart\n"
          f"  duration      ~{est:.0f} min, done around {finish:%H:%M}\n"
          f"  at the end    report saved in {run_dir}; generated audio "
@@ -715,7 +786,7 @@ def main() -> None:
     ap.add_argument("--gap-min", type=float, default=10.0, help="min seconds between commands")
     ap.add_argument("--gap-max", type=float, default=15.0, help="max seconds between commands")
     ap.add_argument("--model", help="ONNX model for FLOP/parameter counts (laptop path or pi:PATH)")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, help="shuffle seed (order + false-wake clips); asked if not given")
     ap.add_argument("--runs-dir", default=str(ROOT / "runs"))
     ap.add_argument("--resume", help="resume / re-score an earlier run folder")
     ap.add_argument("--fresh", action="store_true", help="ignore saved settings from last time")
@@ -778,7 +849,8 @@ def main() -> None:
     samples = link.samples
     if not samples and (run_dir / "pi_samples.jsonl").exists():
         samples = [json.loads(l) for l in (run_dir / "pi_samples.jsonl").read_text(encoding="utf-8").splitlines() if l]
-    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size")}
+    meta = {k: cfg.get(k) for k in ("student", "started", "mode", "host", "wake_word", "wake_gap", "size",
+                                     "seed")}
     meta["holdout"] = cfg.get("holdout") or "huggingface"
     meta["gap_s"] = [args.gap_min, args.gap_max]
     m = score(done, samples, link.specs, prof, t_start, t_end, meta)
@@ -795,7 +867,7 @@ def save_cfg(cfg: dict, run_dir: Path) -> None:
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     if cfg.get("mode") == "sim":
         return                         # a dry run must not overwrite real settings
-    keep = {k: v for k, v in cfg.items() if k not in ("started", "t_start", "size")}
+    keep = {k: v for k, v in cfg.items() if k not in ("started", "t_start", "size", "seed")}
     SAVED_SETTINGS.write_text(json.dumps(keep, indent=2), encoding="utf-8")
 
 

@@ -385,7 +385,7 @@ class SimLink(PiLink):
     def alive(self) -> bool:
         return True
 
-    def respond(self, truth_intent: str, truth_slot: str, t_cmd_end: float) -> None:
+    def respond(self, truth_intent: str, truth_slot: str, t_cmd_end: float, wake: bool = True) -> None:
         from .schema import INTENTS, OOS
         r = self.rng.random()
         now = time.time()
@@ -396,6 +396,11 @@ class SimLink(PiLink):
                              "mem_used_mb": 900, "mem_avail_mb": 3000, "throttled": "0x0",
                              "proc": {"pids": [1], "cpu_pct": self.rng.uniform(20, 90),
                                       "cpu_time_s": self._cpu_time, "rss_mb": 180, "threads": 6}})
+        if not wake:
+            if r < 0.1:                               # woke up without the wake word
+                self.events.put(Event("command", t_cmd_end + latency, truth_intent, truth_slot,
+                                      raw=f"intent={truth_intent} slot={truth_slot}"))
+            return
         if r < 0.05:
             return                                    # missed the wake word
         self.events.put(Event("wake", t_cmd_end - 1.0, raw="wake word detected"))

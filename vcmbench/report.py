@@ -13,6 +13,18 @@ from .slots import slot_distance
 
 def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: dict | None,
           t_start: float, t_end: float, meta: dict) -> dict:
+    no_wake = [t for t in trials if t.get("kind") == "no_wake"]
+    trials = [t for t in trials if t.get("kind", "wake") == "wake"]
+    for t in no_wake:
+        t["false_wake"] = t["n_command_events"] > 0
+    fw = sum(t["false_wake"] for t in no_wake)
+    false_wake = {
+        "n": len(no_wake), "false_wakes": fw,
+        "false_wake_rate": fw / len(no_wake) if no_wake else float("nan"),
+        "false_wake_ci95": M.wilson(fw, len(no_wake)),
+        "wake_word_logged": sum(bool(t.get("wake_logged")) for t in no_wake),
+        "fired": sorted(f"{t.get('transcript', '?')} -> {t['pred_intent']}" for t in no_wake if t["false_wake"]),
+    }
     yt_i, yp_i, yt_c, yp_c, slot_rows = [], [], [], [], []
     for t in trials:
         truth_oos = t["true_intent"] == OOS
@@ -45,6 +57,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
 
     any_wake_log = any(t.get("wake_logged") for t in trials)
     responded = [t for t in trials if t["n_command_events"] > 0]
+    no_timing = sum(t.get("infer_ms") is None or not t.get("audio_ms") for t in responded)
     pi = M.pi_report(samples, trials, t_start, t_end)
     if model_profile and model_profile.get("flops") and pi["infer_ms"].get("n"):
         pi["effective_gflops_per_s"] = model_profile["flops"] / (pi["infer_ms"]["mean"] / 1000) / 1e9
@@ -54,6 +67,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
         "model": model_profile,
         "intent_level": M.classification_report(yt_i, yp_i),
         "command_level": M.classification_report(yt_c, yp_c),
+        "false_wake": false_wake,
         "slots": M.slot_report(slot_rows),
         "by_voice": by_voice,
         "pipeline": {
@@ -63,6 +77,7 @@ def score(trials: list[dict], samples: list[dict], specs: dict, model_profile: d
                                  / len(trials)) if any_wake_log and trials else None,
             "no_response": sum(t["pred_intent"] == NONE for t in trials),
             "extra_fires": sum(max(t["n_command_events"] - 1, 0) for t in trials),
+            "commands_missing_timing": no_timing,
             "unknown_intent_names": sorted({t["pred_intent"] for t in trials
                                             if t["pred_intent"].startswith("OTHER:")}),
         },
@@ -95,7 +110,8 @@ def _table(rows: list[list[str]]) -> list[str]:
 def render_markdown(m: dict) -> str:
     out = [f"# VCM benchmark - {m['meta'].get('student') or 'student'} - {m['meta'].get('started')}", ""]
     meta = m["meta"]
-    out += [f"Wake word: **{meta.get('wake_word')}** - trials: {m['pipeline']['trials']} - "
+    out += [f"Wake word: **{meta.get('wake_word')}** - trials: {m['pipeline']['trials']} with the wake word + "
+            f"{m['false_wake']['n']} without - shuffle seed: {meta.get('seed')} - "
             f"connection: {meta.get('mode')} - holdout: {meta.get('holdout')}", ""]
 
     out += ["## Classification", ""]
@@ -111,12 +127,21 @@ def render_markdown(m: dict) -> str:
     rows.append(["accuracy 95% CI", _ci(I["accuracy_ci95"]), _ci(C["accuracy_ci95"])])
     rows.append(["false accept 95% CI", f"{_ci(I['false_accept_ci95'])} ({I['false_accepts']}/{I['n_out_of_scope']})",
                  f"{_ci(C['false_accept_ci95'])}"])
+    F = m["false_wake"]
+    if F["n"]:
+        fw = f"{_fmt(F['false_wake_rate'], True)} {_ci(F['false_wake_ci95'])} ({F['false_wakes']}/{F['n']})"
+        rows.append(["false wake rate (command without wake word fired)", fw, fw])
     out += _table(rows) + [""]
 
     p = m["pipeline"]
     out += [f"Responses: {_fmt(p['response_rate'], True)} of trials fired a command; "
             f"no response: {p['no_response']}; extra fires: {p['extra_fires']}; "
             f"wake detect rate: {_fmt(p['wake_detect_rate'], True)}", ""]
+    if p.get("commands_missing_timing"):
+        out += [f"**Timing missing:** {p['commands_missing_timing']} command line(s) had no infer_ms/audio_ms "
+                "(required); inference time and real-time factor use only the lines that had them.", ""]
+    if F["n"] and F["fired"]:
+        out += ["**False wakes (no wake word, Pi fired):** " + "; ".join(F["fired"]), ""]
     if p["unknown_intent_names"]:
         out += [f"**Unknown intent names from the Pi (scored wrong; add aliases):** "
                 f"{', '.join(p['unknown_intent_names'])}", ""]
@@ -186,11 +211,14 @@ def render_markdown(m: dict) -> str:
             "Command level: a prediction matches a variation when intent and slot are right (the Pi does "
             "not predict the wording); wrong predictions count against the first variation of their "
             "(intent, slot). Macro scores average over classes present in the holdout. False accept rate "
-            "rests on only the out-of-scope clips in the holdout, so read its confidence interval.", ""]
+            "rests on only the out-of-scope clips in the holdout, so read its confidence interval. False wake "
+            "rate: in-scope commands played WITHOUT the wake word (as many as the out-of-scope clips); "
+            "any command the Pi fires for them is a false wake. These trials are not part of the "
+            "19/93 scores.", ""]
     return "\n".join(out)
 
 
-TRIAL_COLUMNS = ["order", "clip_idx", "transcript", "true_intent", "true_variation", "true_slot",
+TRIAL_COLUMNS = ["order", "kind", "false_wake", "clip_idx", "transcript", "true_intent", "true_variation", "true_slot",
                  "pred_intent", "pred_slot", "pred_raw", "correct_intent", "correct_command",
                  "slot_exact", "slot_abs_error", "slot_phonetic_dist", "n_command_events", "wake_logged",
                  "latency_s", "infer_ms", "audio_ms", "speaker_id", "is_synthetic", "wake_take", "audio_file"]
